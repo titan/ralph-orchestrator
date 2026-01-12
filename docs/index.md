@@ -2,7 +2,7 @@
 
 <div align="center">
 
-## Production-Ready AI Orchestration
+## Alpha-Quality AI Orchestration
 
 *Put your AI agent in a loop until the task is done*
 
@@ -17,9 +17,9 @@
 
 ## What is Ralph Orchestrator?
 
-Ralph Orchestrator is a production-ready implementation of the **Ralph Wiggum orchestration technique** - a simple yet powerful pattern for autonomous AI task completion. As [Geoffrey Huntley](https://ghuntley.com/ralph/) originally defined it: **"Ralph is a Bash loop"** that continuously runs an AI agent against a prompt file until the task is marked as complete or limits are reached.
+Ralph Orchestrator is a functional, early-stage (alpha) implementation of the **Ralph Wiggum orchestration technique** - a simple but powerful pattern for autonomous AI task completion. As [Geoffrey Huntley](https://ghuntley.com/ralph/) originally defined it: **"Ralph is a Bash loop"** that continuously runs an AI agent against a prompt file until the task is marked as complete or limits are reached.
 
-Based on Huntley's technique, this implementation provides enterprise-grade safety, monitoring, and cost controls suitable for production environments. For Claude Code users, also see the official [ralph-wiggum plugin](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum).
+Based on Huntley's technique, this implementation adds practical safety, monitoring, and cost controls for real-world usage. It works today, but expect rough edges and occasional breaking API/config changes between releases. For Claude Code users, also see the official [ralph-wiggum plugin](https://github.com/anthropics/claude-code/tree/main/plugins/ralph-wiggum).
 
 ## Key Features
 
@@ -31,10 +31,10 @@ Based on Huntley's technique, this implementation provides enterprise-grade safe
 - **💰 Cost Management**  
   Real-time token tracking, cost calculation, and configurable spending limits
 
-- **🔒 Enterprise Security**  
+- **🔒 Security Controls**  
   Input sanitization, command injection prevention, and path traversal protection
 
-- **📊 Production Monitoring**  
+- **📊 Monitoring & Metrics**  
   System metrics, performance tracking, and detailed JSON exports
 
 - **🔄 Resilient Execution**  
@@ -74,7 +74,7 @@ Ralph Orchestrator automates the iteration loop while maintaining safety and con
 
 - **Autonomous Operation**: Set it and forget it - Ralph handles the iterations
 - **Safety First**: Built-in limits prevent runaway costs and infinite loops
-- **Production Ready**: Battle-tested with comprehensive error handling
+- **Alpha-Quality**: Solid capabilities, with APIs/config still evolving
 - **Observable**: Detailed metrics and logging for debugging and optimization
 - **Recoverable**: Checkpoint system allows resuming from any point
 
@@ -92,9 +92,9 @@ Ralph Orchestrator excels at:
 
 Ready to put Ralph to work? Check out our [Quick Start Guide](quick-start.md) to get up and running in minutes.
 
-## Production Features
+## Operational Features
 
-Ralph Orchestrator is designed for production use with:
+Ralph Orchestrator focuses on safety, control, and observability with:
 
 - **Token & Cost Limits**: Prevent budget overruns
 - **Context Management**: Handle large prompts intelligently
@@ -103,7 +103,7 @@ Ralph Orchestrator is designed for production use with:
 - **Error Recovery**: Graceful handling of failures
 - **State Persistence**: Resume interrupted tasks
 
-Learn more in our [Production Deployment Guide](advanced/production-deployment.md).
+Learn more in our [Deployment Guide (alpha)](advanced/production-deployment.md).
 
 ## Community & Support
 
