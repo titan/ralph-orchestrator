@@ -38,7 +38,7 @@ python ralph_orchestrator.py --agent claude
 
 ### Q Chat
 
-Q Chat is a cost-effective AI assistant suitable for many general tasks, now with production-ready adapter implementation.
+Q Chat is a cost-effective AI assistant suitable for many general tasks, with a solid adapter implementation.
 
 **Strengths:**
 - Good general-purpose capabilities
@@ -71,7 +71,7 @@ python ralph_orchestrator.py --agent q
 python ralph_orchestrator.py -a q
 ```
 
-**Production Features:**
+**Operational Features:**
 - **Message Queue**: Thread-safe async message processing
 - **Error Recovery**: Automatic retry with exponential backoff
 - **Signal Handling**: Graceful shutdown on SIGINT/SIGTERM
