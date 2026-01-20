@@ -14,7 +14,7 @@ use ratatui::{
 // - Priority 1: Iteration counter [iter N/M] - always shown (TUI pagination)
 // - Priority 2: Mode indicator [LIVE]/[REVIEW] (▶/◀ compressed) - always shown
 // - Priority 3: Hat display, Scroll indicator - compressed at 50
-// - Priority 4: Elapsed time MM:SS - hidden at 50
+// - Priority 4: Iteration elapsed time MM:SS - hidden at 50
 // - Priority 5: Idle countdown - hidden at 40
 // - Priority 6: Help hint - hidden at 65
 // ============================================================================
@@ -40,8 +40,8 @@ pub fn render(state: &TuiState, width: u16) -> Paragraph<'static> {
     let iter_display = format!("[iter {}/{}]", current, total);
     spans.push(Span::raw(iter_display));
 
-    // Priority 4: Elapsed time - hidden at WIDTH_COMPRESS and below
-    if let Some(elapsed) = state.get_loop_elapsed()
+    // Priority 4: Elapsed time (iteration) - hidden at WIDTH_COMPRESS and below
+    if let Some(elapsed) = state.get_iteration_elapsed()
         && width > WIDTH_COMPRESS
     {
         let total_secs = elapsed.as_secs();
@@ -179,8 +179,8 @@ mod tests {
         let event = Event::new("task.start", "");
         state.update(&event);
 
-        // Simulate 4 minutes 32 seconds elapsed
-        state.loop_started = Some(
+        // Simulate 4 minutes 32 seconds elapsed for current iteration
+        state.iteration_started = Some(
             std::time::Instant::now()
                 .checked_sub(Duration::from_secs(272))
                 .unwrap(),
@@ -251,7 +251,7 @@ mod tests {
         state.current_view = 2; // Viewing iteration 3 of 10
         state.following_latest = true;
 
-        state.loop_started = Some(
+        state.iteration_started = Some(
             std::time::Instant::now()
                 .checked_sub(Duration::from_secs(272))
                 .unwrap(),
@@ -308,7 +308,7 @@ mod tests {
         state.current_view = 2; // Viewing iteration 3 of 10
         state.following_latest = true; // In LIVE mode
 
-        state.loop_started = Some(
+        state.iteration_started = Some(
             std::time::Instant::now()
                 .checked_sub(Duration::from_secs(272))
                 .unwrap(),
@@ -539,12 +539,12 @@ mod tests {
 
     #[test]
     fn header_preserves_elapsed_time_with_new_format() {
-        // Given 5 minutes elapsed
+        // Given 5 minutes elapsed for current iteration
         let mut state = TuiState::new();
         state.start_new_iteration();
         let event = Event::new("task.start", "");
         state.update(&event);
-        state.loop_started = Some(
+        state.iteration_started = Some(
             std::time::Instant::now()
                 .checked_sub(Duration::from_secs(300))
                 .unwrap(),
