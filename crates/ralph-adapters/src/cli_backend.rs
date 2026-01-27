@@ -130,11 +130,11 @@ impl CliBackend {
         }
     }
 
-    /// Creates the Kiro backend with a specific agent.
+    /// Creates the Kiro backend with a specific agent and optional extra args.
     ///
     /// Uses kiro-cli with --agent flag to select a specific agent.
-    pub fn kiro_with_agent(agent: String) -> Self {
-        Self {
+    pub fn kiro_with_agent(agent: String, extra_args: &[String]) -> Self {
+        let mut backend = Self {
             command: "kiro-cli".to_string(),
             args: vec![
                 "chat".to_string(),
@@ -146,7 +146,22 @@ impl CliBackend {
             prompt_mode: PromptMode::Arg,
             prompt_flag: None,
             output_format: OutputFormat::Text,
-        }
+        };
+        backend.args.extend(extra_args.iter().cloned());
+        backend
+    }
+
+    /// Creates a backend from a named backend with additional args.
+    ///
+    /// # Errors
+    /// Returns error if the backend name is invalid.
+    pub fn from_name_with_args(
+        name: &str,
+        extra_args: &[String],
+    ) -> Result<Self, CustomBackendError> {
+        let mut backend = Self::from_name(name)?;
+        backend.args.extend(extra_args.iter().cloned());
+        Ok(backend)
     }
 
     /// Creates a backend from a named backend string.
@@ -173,7 +188,12 @@ impl CliBackend {
     pub fn from_hat_backend(hat_backend: &HatBackend) -> Result<Self, CustomBackendError> {
         match hat_backend {
             HatBackend::Named(name) => Self::from_name(name),
-            HatBackend::KiroAgent { agent, .. } => Ok(Self::kiro_with_agent(agent.clone())),
+            HatBackend::NamedWithArgs { backend_type, args } => {
+                Self::from_name_with_args(backend_type, args)
+            }
+            HatBackend::KiroAgent { agent, args, .. } => {
+                Ok(Self::kiro_with_agent(agent.clone(), args))
+            }
             HatBackend::Custom { command, args } => Ok(Self {
                 command: command.clone(),
                 args: args.clone(),
@@ -820,7 +840,7 @@ mod tests {
 
     #[test]
     fn test_kiro_with_agent() {
-        let backend = CliBackend::kiro_with_agent("my-agent".to_string());
+        let backend = CliBackend::kiro_with_agent("my-agent".to_string(), &[]);
         let (cmd, args, stdin, _temp) = backend.build_command("test prompt", false);
 
         assert_eq!(cmd, "kiro-cli");
@@ -832,6 +852,29 @@ mod tests {
                 "--trust-all-tools",
                 "--agent",
                 "my-agent",
+                "test prompt"
+            ]
+        );
+        assert!(stdin.is_none());
+    }
+
+    #[test]
+    fn test_kiro_with_agent_extra_args() {
+        let extra_args = vec!["--verbose".to_string(), "--debug".to_string()];
+        let backend = CliBackend::kiro_with_agent("my-agent".to_string(), &extra_args);
+        let (cmd, args, stdin, _temp) = backend.build_command("test prompt", false);
+
+        assert_eq!(cmd, "kiro-cli");
+        assert_eq!(
+            args,
+            vec![
+                "chat",
+                "--no-interactive",
+                "--trust-all-tools",
+                "--agent",
+                "my-agent",
+                "--verbose",
+                "--debug",
                 "test prompt"
             ]
         );
@@ -894,12 +937,40 @@ mod tests {
         let hat_backend = HatBackend::KiroAgent {
             backend_type: "kiro".to_string(),
             agent: "my-agent".to_string(),
+            args: vec![],
         };
         let backend = CliBackend::from_hat_backend(&hat_backend).unwrap();
         let (cmd, args, _, _) = backend.build_command("test", false);
         assert_eq!(cmd, "kiro-cli");
         assert!(args.contains(&"--agent".to_string()));
         assert!(args.contains(&"my-agent".to_string()));
+    }
+
+    #[test]
+    fn test_from_hat_backend_kiro_agent_with_args() {
+        let hat_backend = HatBackend::KiroAgent {
+            backend_type: "kiro".to_string(),
+            agent: "my-agent".to_string(),
+            args: vec!["--verbose".to_string()],
+        };
+        let backend = CliBackend::from_hat_backend(&hat_backend).unwrap();
+        let (cmd, args, _, _) = backend.build_command("test", false);
+        assert_eq!(cmd, "kiro-cli");
+        assert!(args.contains(&"--agent".to_string()));
+        assert!(args.contains(&"my-agent".to_string()));
+        assert!(args.contains(&"--verbose".to_string()));
+    }
+
+    #[test]
+    fn test_from_hat_backend_named_with_args() {
+        let hat_backend = HatBackend::NamedWithArgs {
+            backend_type: "claude".to_string(),
+            args: vec!["--model".to_string(), "claude-sonnet-4".to_string()],
+        };
+        let backend = CliBackend::from_hat_backend(&hat_backend).unwrap();
+        assert_eq!(backend.command, "claude");
+        assert!(backend.args.contains(&"--model".to_string()));
+        assert!(backend.args.contains(&"claude-sonnet-4".to_string()));
     }
 
     #[test]
@@ -1091,6 +1162,35 @@ mod tests {
             "opencode_interactive() should use --prompt flag for TUI mode. \
              Expected args to contain '--prompt', got: {:?}",
             args
+        );
+    }
+
+    #[test]
+    fn test_custom_args_can_be_appended() {
+        // Verify that custom args can be appended to backend args
+        // This is used for `ralph run -b opencode -- --model="some-model"`
+        let mut backend = CliBackend::opencode();
+
+        // Append custom args
+        let custom_args = vec!["--model=gpt-4".to_string(), "--temperature=0.7".to_string()];
+        backend.args.extend(custom_args.clone());
+
+        // Build command and verify custom args are included
+        let (cmd, args, _, _) = backend.build_command("test prompt", false);
+
+        assert_eq!(cmd, "opencode");
+        // Should have: original args + custom args + prompt
+        assert!(args.contains(&"run".to_string())); // Original arg
+        assert!(args.contains(&"--model=gpt-4".to_string())); // Custom arg
+        assert!(args.contains(&"--temperature=0.7".to_string())); // Custom arg
+        assert!(args.contains(&"test prompt".to_string())); // Prompt
+
+        // Verify order: original args come before custom args
+        let run_idx = args.iter().position(|a| a == "run").unwrap();
+        let model_idx = args.iter().position(|a| a == "--model=gpt-4").unwrap();
+        assert!(
+            run_idx < model_idx,
+            "Original args should come before custom args"
         );
     }
 }

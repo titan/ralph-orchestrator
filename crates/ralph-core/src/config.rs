@@ -970,16 +970,30 @@ pub struct EventMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum HatBackend {
-    /// Named backend (e.g., "claude", "gemini", "kiro").
-    Named(String),
-    /// Kiro agent with custom agent name.
+    // Order matters for serde untagged - most specific first
+    /// Kiro agent with custom agent name and optional args.
     KiroAgent {
         #[serde(rename = "type")]
         backend_type: String,
         agent: String,
+        #[serde(default)]
+        args: Vec<String>,
     },
+    /// Named backend with args (has `type` but no `agent`).
+    NamedWithArgs {
+        #[serde(rename = "type")]
+        backend_type: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// Simple named backend (string form).
+    Named(String),
     /// Custom backend with command and args.
-    Custom { command: String, args: Vec<String> },
+    Custom {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 impl HatBackend {
@@ -987,6 +1001,7 @@ impl HatBackend {
     pub fn to_cli_backend(&self) -> String {
         match self {
             HatBackend::Named(name) => name.clone(),
+            HatBackend::NamedWithArgs { backend_type, .. } => backend_type.clone(),
             HatBackend::KiroAgent { .. } => "kiro".to_string(),
             HatBackend::Custom { .. } => "custom".to_string(),
         }
@@ -1631,11 +1646,70 @@ agent: "builder"
             HatBackend::KiroAgent {
                 backend_type,
                 agent,
+                args,
             } => {
                 assert_eq!(backend_type, "kiro");
                 assert_eq!(agent, "builder");
+                assert!(args.is_empty());
             }
             _ => panic!("Expected KiroAgent variant"),
+        }
+    }
+
+    #[test]
+    fn test_hat_backend_kiro_agent_with_args() {
+        let yaml = r#"
+type: "kiro"
+agent: "builder"
+args: ["--verbose", "--debug"]
+"#;
+        let backend: HatBackend = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(backend.to_cli_backend(), "kiro");
+        match backend {
+            HatBackend::KiroAgent {
+                backend_type,
+                agent,
+                args,
+            } => {
+                assert_eq!(backend_type, "kiro");
+                assert_eq!(agent, "builder");
+                assert_eq!(args, vec!["--verbose", "--debug"]);
+            }
+            _ => panic!("Expected KiroAgent variant"),
+        }
+    }
+
+    #[test]
+    fn test_hat_backend_named_with_args() {
+        let yaml = r#"
+type: "claude"
+args: ["--model", "claude-sonnet-4"]
+"#;
+        let backend: HatBackend = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(backend.to_cli_backend(), "claude");
+        match backend {
+            HatBackend::NamedWithArgs { backend_type, args } => {
+                assert_eq!(backend_type, "claude");
+                assert_eq!(args, vec!["--model", "claude-sonnet-4"]);
+            }
+            _ => panic!("Expected NamedWithArgs variant"),
+        }
+    }
+
+    #[test]
+    fn test_hat_backend_named_with_args_empty() {
+        // type: claude without args should still work (NamedWithArgs with empty args)
+        let yaml = r#"
+type: "gemini"
+"#;
+        let backend: HatBackend = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(backend.to_cli_backend(), "gemini");
+        match backend {
+            HatBackend::NamedWithArgs { backend_type, args } => {
+                assert_eq!(backend_type, "gemini");
+                assert!(args.is_empty());
+            }
+            _ => panic!("Expected NamedWithArgs variant"),
         }
     }
 
@@ -1745,9 +1819,11 @@ hats:
             HatBackend::KiroAgent {
                 backend_type,
                 agent,
+                args,
             } => {
                 assert_eq!(backend_type, "kiro");
                 assert_eq!(agent, "builder");
+                assert!(args.is_empty());
             }
             _ => panic!("Expected KiroAgent backend for builder"),
         }
