@@ -598,7 +598,7 @@ pub struct CoreConfig {
     #[serde(default = "default_guardrails")]
     pub guardrails: Vec<String>,
 
-    /// Root directory for workspace-relative paths (.agent/, memories, etc.).
+    /// Root directory for workspace-relative paths (.ralph/, specs, etc.).
     ///
     /// All relative paths (scratchpad, specs_dir, memories) are resolved relative
     /// to this directory. Defaults to the current working directory.
@@ -609,11 +609,11 @@ pub struct CoreConfig {
 }
 
 fn default_scratchpad() -> String {
-    ".agent/scratchpad.md".to_string()
+    ".ralph/agent/scratchpad.md".to_string()
 }
 
 fn default_specs_dir() -> String {
-    "./specs/".to_string()
+    ".ralph/specs/".to_string()
 }
 
 fn default_guardrails() -> Vec<String> {
@@ -621,6 +621,7 @@ fn default_guardrails() -> Vec<String> {
         "Fresh context each iteration - scratchpad is memory".to_string(),
         "Don't assume 'not implemented' - search first".to_string(),
         "Backpressure is law - tests/typecheck/lint must pass".to_string(),
+        "Commit atomically - one logical change per commit, capture the why".to_string(),
     ]
 }
 
@@ -669,7 +670,8 @@ pub struct CliConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
 
-    /// Custom command (for backend: "custom").
+    /// Command override. Required for "custom" backend.
+    /// For named backends, overrides the default binary path.
     pub command: Option<String>,
 
     /// How to pass prompts: "arg" or "stdin".
@@ -764,7 +766,7 @@ impl std::fmt::Display for InjectMode {
 /// Memories configuration.
 ///
 /// Controls the persistent learning system that allows Ralph to accumulate
-/// wisdom across sessions. Memories are stored in `.agent/memories.md`.
+/// wisdom across sessions. Memories are stored in `.ralph/agent/memories.md`.
 ///
 /// When enabled, the memories skill is automatically injected to teach
 /// agents how to create and search memories (skill injection is implicit).
@@ -831,7 +833,7 @@ pub struct MemoriesFilter {
 /// Tasks configuration.
 ///
 /// Controls the runtime task tracking system that allows Ralph to manage
-/// work items across iterations. Tasks are stored in `.agent/tasks.jsonl`.
+/// work items across iterations. Tasks are stored in `.ralph/agent/tasks.jsonl`.
 ///
 /// When enabled, tasks replace scratchpad for loop completion verification.
 ///
@@ -857,12 +859,127 @@ impl Default for TasksConfig {
     }
 }
 
+/// Chaos mode configuration.
+///
+/// Chaos mode activates after LOOP_COMPLETE to grow the original objective
+/// into related improvements and learnings.
+///
+/// Example configuration:
+/// ```yaml
+/// features:
+///   chaos_mode:
+///     enabled: false              # Disabled by default (opt-in via --chaos)
+///     max_iterations: 5           # Max chaos iterations (default: 5)
+///     cooldown_seconds: 30        # Cooldown between chaos iterations (default: 30)
+///     completion_promise: "CHAOS_COMPLETE"  # Exit token
+///     research_focus:             # Configurable focus areas
+///       - domain_best_practices   # Web search for domain patterns
+///       - codebase_patterns       # Internal code analysis
+///       - self_improvement        # Meta-prompt and event loop study
+///     outputs:                    # What chaos mode can create
+///       - memories                # Always enabled
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChaosModeConfig {
+    /// Whether chaos mode is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum iterations in chaos mode.
+    #[serde(default = "default_chaos_max_iterations")]
+    pub max_iterations: u32,
+
+    /// Cooldown period between chaos iterations (seconds).
+    #[serde(default = "default_chaos_cooldown")]
+    pub cooldown_seconds: u64,
+
+    /// Completion promise for chaos mode exit.
+    #[serde(default = "default_chaos_completion")]
+    pub completion_promise: String,
+
+    /// Configurable research focus areas.
+    #[serde(default = "default_research_focus")]
+    pub research_focus: Vec<ResearchFocus>,
+
+    /// What outputs chaos mode can create.
+    #[serde(default = "default_chaos_outputs")]
+    pub outputs: Vec<ChaosOutput>,
+}
+
+fn default_chaos_max_iterations() -> u32 {
+    5
+}
+
+fn default_chaos_cooldown() -> u64 {
+    30 // 30 seconds between iterations
+}
+
+fn default_chaos_completion() -> String {
+    "CHAOS_COMPLETE".to_string()
+}
+
+fn default_research_focus() -> Vec<ResearchFocus> {
+    vec![
+        ResearchFocus::DomainBestPractices,
+        ResearchFocus::CodebasePatterns,
+        ResearchFocus::SelfImprovement,
+    ]
+}
+
+fn default_chaos_outputs() -> Vec<ChaosOutput> {
+    vec![ChaosOutput::Memories] // Only memories by default
+}
+
+impl Default for ChaosModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_iterations: default_chaos_max_iterations(),
+            cooldown_seconds: default_chaos_cooldown(),
+            completion_promise: default_chaos_completion(),
+            research_focus: default_research_focus(),
+            outputs: default_chaos_outputs(),
+        }
+    }
+}
+
+/// Research focus area for chaos mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchFocus {
+    /// Web search for domain patterns and best practices.
+    DomainBestPractices,
+    /// Internal codebase analysis for patterns and antipatterns.
+    CodebasePatterns,
+    /// Meta-prompt and event loop study for self-improvement.
+    SelfImprovement,
+}
+
+/// Output type that chaos mode can create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChaosOutput {
+    /// Persistent learning memories.
+    Memories,
+    /// Create tasks for concrete work.
+    Tasks,
+    /// Create specs for larger improvements.
+    Specs,
+}
+
 /// Feature flags for optional Ralph capabilities.
 ///
 /// Example configuration:
 /// ```yaml
 /// features:
 ///   parallel: true  # Enable parallel loops via git worktrees
+///   auto_merge: false  # Auto-merge worktree branches on completion
+///   loop_naming:
+///     format: human-readable  # or "timestamp" for legacy format
+///     max_length: 50
+///   chaos_mode:
+///     enabled: false
+///     max_iterations: 5
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeaturesConfig {
@@ -872,12 +989,38 @@ pub struct FeaturesConfig {
     /// a parallel loop in a git worktree. When false, Ralph errors instead.
     #[serde(default = "default_true")]
     pub parallel: bool,
+
+    /// Whether to automatically merge worktree branches on completion.
+    ///
+    /// When false (default), completed worktree loops queue for manual merge.
+    /// When true, Ralph automatically merges the worktree branch into the
+    /// main branch after a parallel loop completes.
+    #[serde(default)]
+    pub auto_merge: bool,
+
+    /// Loop naming configuration for worktree branches.
+    ///
+    /// Controls how loop IDs are generated for parallel loops.
+    /// Default uses human-readable format: `fix-header-swift-peacock`
+    /// Legacy timestamp format: `ralph-YYYYMMDD-HHMMSS-XXXX`
+    #[serde(default)]
+    pub loop_naming: crate::loop_name::LoopNamingConfig,
+
+    /// Chaos mode configuration.
+    ///
+    /// Chaos mode activates after LOOP_COMPLETE to explore related
+    /// improvements and learnings based on the original objective.
+    #[serde(default)]
+    pub chaos_mode: ChaosModeConfig,
 }
 
 impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
-            parallel: true, // Parallel loops enabled by default
+            parallel: true,    // Parallel loops enabled by default
+            auto_merge: false, // Auto-merge disabled by default for safety
+            loop_naming: crate::loop_name::LoopNamingConfig::default(),
+            chaos_mode: ChaosModeConfig::default(),
         }
     }
 }
@@ -1413,13 +1556,14 @@ hats:
     #[test]
     fn test_core_config_defaults() {
         let config = RalphConfig::default();
-        assert_eq!(config.core.scratchpad, ".agent/scratchpad.md");
-        assert_eq!(config.core.specs_dir, "./specs/");
+        assert_eq!(config.core.scratchpad, ".ralph/agent/scratchpad.md");
+        assert_eq!(config.core.specs_dir, ".ralph/specs/");
         // Default guardrails per spec
-        assert_eq!(config.core.guardrails.len(), 3);
+        assert_eq!(config.core.guardrails.len(), 4);
         assert!(config.core.guardrails[0].contains("Fresh context"));
         assert!(config.core.guardrails[1].contains("search first"));
         assert!(config.core.guardrails[2].contains("Backpressure"));
+        assert!(config.core.guardrails[3].contains("Commit atomically"));
     }
 
     #[test]
@@ -1433,14 +1577,14 @@ core:
         assert_eq!(config.core.scratchpad, ".workspace/plan.md");
         assert_eq!(config.core.specs_dir, "./specifications/");
         // Guardrails should use defaults when not specified
-        assert_eq!(config.core.guardrails.len(), 3);
+        assert_eq!(config.core.guardrails.len(), 4);
     }
 
     #[test]
     fn test_core_config_custom_guardrails() {
         let yaml = r#"
 core:
-  scratchpad: ".agent/scratchpad.md"
+  scratchpad: ".ralph/agent/scratchpad.md"
   specs_dir: "./specs/"
   guardrails:
     - "Custom rule one"
@@ -1842,5 +1986,57 @@ hats:
             reviewer.default_publishes,
             Some("review.complete".to_string())
         );
+    }
+
+    #[test]
+    fn test_features_config_auto_merge_defaults_to_false() {
+        // Per spec: auto_merge should default to false for safety
+        // This prevents automatic merging of parallel loop branches
+        let config = RalphConfig::default();
+        assert!(
+            !config.features.auto_merge,
+            "auto_merge should default to false"
+        );
+    }
+
+    #[test]
+    fn test_features_config_auto_merge_from_yaml() {
+        // Users can opt into auto_merge via config
+        let yaml = r"
+features:
+  auto_merge: true
+";
+        let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            config.features.auto_merge,
+            "auto_merge should be true when configured"
+        );
+    }
+
+    #[test]
+    fn test_features_config_auto_merge_false_from_yaml() {
+        // Explicit false should work too
+        let yaml = r"
+features:
+  auto_merge: false
+";
+        let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            !config.features.auto_merge,
+            "auto_merge should be false when explicitly configured"
+        );
+    }
+
+    #[test]
+    fn test_features_config_preserves_parallel_when_adding_auto_merge() {
+        // Ensure adding auto_merge doesn't break existing parallel feature
+        let yaml = r"
+features:
+  parallel: false
+  auto_merge: true
+";
+        let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.features.parallel, "parallel should be false");
+        assert!(config.features.auto_merge, "auto_merge should be true");
     }
 }

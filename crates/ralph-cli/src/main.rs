@@ -22,12 +22,13 @@ mod presets;
 mod sop_runner;
 mod task_cli;
 mod tools;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use ralph_adapters::detect_backend;
 use ralph_core::{
-    EventHistory, LockError, LoopContext, LoopLock, RalphConfig,
+    EventHistory, LockError, LoopContext, LoopEntry, LoopLock, LoopRegistry, RalphConfig,
     worktree::{WorktreeConfig, create_worktree, ensure_gitignore},
 };
 use std::fs;
@@ -402,6 +403,9 @@ enum Commands {
 
     /// Manage configured hats
     Hats(hats::HatsArgs),
+
+    /// Run the web dashboard
+    Web(web::WebArgs),
 }
 
 /// Arguments for the init subcommand.
@@ -489,6 +493,19 @@ struct RunArgs {
     /// Only relevant for parallel loops running in worktrees.
     #[arg(long)]
     no_auto_merge: bool,
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Chaos Mode Options
+    // ─────────────────────────────────────────────────────────────────────────
+    /// Enable chaos mode: after LOOP_COMPLETE, explore related improvements.
+    /// Activates ONLY after successful completion, not on other termination.
+    #[arg(long)]
+    chaos: bool,
+
+    /// Maximum chaos mode iterations (default: 5).
+    /// Only relevant when --chaos is enabled.
+    #[arg(long, requires = "chaos")]
+    chaos_max_iterations: Option<u32>,
 
     // ─────────────────────────────────────────────────────────────────────────
     // Verbosity Options
@@ -674,9 +691,11 @@ async fn main() -> Result<()> {
 
     if tui_enabled {
         // TUI mode: logs would corrupt the display, so we suppress them entirely.
-        // For debugging TUI issues, set RALPH_DEBUG_LOG=1 to write to .agent/ralph.log
+        // For debugging TUI issues, set RALPH_DEBUG_LOG=1 to write to .ralph/agent/ralph.log
         if std::env::var("RALPH_DEBUG_LOG").is_ok() {
-            let log_path = std::path::Path::new(".agent").join("ralph.log");
+            let log_path = std::path::Path::new(".ralph")
+                .join("agent")
+                .join("ralph.log");
             if let Ok(file) = std::fs::File::create(&log_path) {
                 if diagnostics_enabled {
                     // TUI + diagnostics: logs to file + trace layer
@@ -771,6 +790,7 @@ async fn main() -> Result<()> {
         Some(Commands::Hats(args)) => {
             hats::execute(&config_sources, args, cli.color.should_use_colors())
         }
+        Some(Commands::Web(args)) => web::execute(args).await,
         None => {
             // Default to run with TUI enabled (new default behavior)
             let args = RunArgs {
@@ -786,6 +806,8 @@ async fn main() -> Result<()> {
                 idle_timeout: None,
                 exclusive: false,
                 no_auto_merge: false,
+                chaos: false,
+                chaos_max_iterations: None,
                 verbose: false,
                 quiet: false,
                 record_session: None,
@@ -1015,18 +1037,32 @@ async fn run_command(
     ensure_scratchpad_directory(&config)?;
 
     // Get the prompt for lock metadata (short version for display)
+    // When prompt_file is used, read its content for the summary instead of showing the file path
     let prompt_summary = config
         .event_loop
         .prompt
-        .as_ref()
+        .clone()
+        .or_else(|| {
+            let prompt_file = &config.event_loop.prompt_file;
+            if prompt_file.is_empty() {
+                None
+            } else {
+                let path = std::path::Path::new(prompt_file);
+                if path.exists() {
+                    std::fs::read_to_string(path).ok()
+                } else {
+                    None
+                }
+            }
+        })
         .map(|p| {
             if p.len() > 100 {
                 format!("{}...", &p[..100])
             } else {
-                p.clone()
+                p
             }
         })
-        .unwrap_or_else(|| config.event_loop.prompt_file.clone());
+        .unwrap_or_else(|| "[no prompt]".to_string());
 
     // Try to acquire the loop lock for multi-loop concurrency support
     // This implements the lock detection flow from the multi-loop spec
@@ -1068,8 +1104,15 @@ async fn run_command(
                     existing.prompt.chars().take(50).collect::<String>()
                 );
 
-                let loop_id = generate_loop_id();
                 let worktree_config = WorktreeConfig::default();
+
+                // Generate memorable loop ID (adjective-noun only, no prompt keywords)
+                // This ID will be used consistently for: registry ID, worktree path, and branch name
+                let name_generator =
+                    ralph_core::LoopNameGenerator::from_config(&config.features.loop_naming);
+                let loop_id = name_generator.generate_memorable_unique(|name| {
+                    ralph_core::worktree_exists(workspace_root, name, &worktree_config)
+                });
 
                 // Ensure worktree directory is in .gitignore
                 ensure_gitignore(workspace_root, ".worktrees")
@@ -1092,10 +1135,28 @@ async fn run_command(
                     workspace_root.clone(),
                 );
 
-                // Set up memory symlink so parallel loop shares memories
+                // Set up all worktree symlinks (memories, specs, code tasks)
                 context
-                    .setup_memory_symlink()
-                    .context("Failed to create memory symlink in worktree")?;
+                    .setup_worktree_symlinks()
+                    .context("Failed to create symlinks in worktree")?;
+
+                // Generate context file with worktree metadata
+                context
+                    .generate_context_file(&worktree.branch, &prompt_summary)
+                    .context("Failed to generate context file in worktree")?;
+
+                // Register this loop in the registry with the SAME loop_id
+                // This ensures registry ID matches worktree path and branch name
+                let registry = LoopRegistry::new(workspace_root);
+                let entry = LoopEntry::with_id(
+                    &loop_id,
+                    &prompt_summary,
+                    Some(worktree.path.to_string_lossy().to_string()),
+                    worktree.path.to_string_lossy().to_string(),
+                );
+                registry
+                    .register(entry)
+                    .context("Failed to register loop in registry")?;
 
                 // Update config to use worktree paths
                 // The scratchpad and other paths should resolve to the worktree
@@ -1137,6 +1198,12 @@ async fn run_command(
     let enable_tui = !args.no_tui && !args.autonomous;
     let verbosity = Verbosity::resolve(verbose || args.verbose, args.quiet);
     let custom_args = args.custom_args;
+    // --no-auto-merge CLI flag overrides config.features.auto_merge
+    let auto_merge_override = if args.no_auto_merge {
+        Some(false)
+    } else {
+        None
+    };
     let reason = loop_runner::run_loop_impl(
         config,
         color_mode,
@@ -1146,6 +1213,7 @@ async fn run_command(
         args.record_session,
         Some(loop_context),
         custom_args,
+        auto_merge_override,
     )
     .await?;
     let exit_code = reason.exit_code();
@@ -1156,23 +1224,6 @@ async fn run_command(
     }
 
     Ok(())
-}
-
-/// Generates a unique loop ID for worktree-based parallel loops.
-///
-/// Format: `ralph-YYYYMMDD-HHMMSS-XXXX` where XXXX is a random hex suffix.
-fn generate_loop_id() -> String {
-    use std::time::SystemTime;
-
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-
-    // Generate 4-character random hex suffix
-    let random_suffix: u16 = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| (d.as_nanos() & 0xFFFF) as u16)
-        .unwrap_or(0);
-
-    format!("ralph-{}-{:04x}", timestamp, random_suffix)
 }
 
 /// Resume a previously interrupted loop from existing scratchpad.
@@ -1276,6 +1327,7 @@ async fn resume_command(
         args.record_session,
         None,       // Deprecated resume command doesn't have loop_context
         Vec::new(), // Resume command doesn't support custom args
+        None,       // Use config.features.auto_merge (deprecated command)
     )
     .await?;
     let exit_code = reason.exit_code();
@@ -2033,5 +2085,140 @@ core:
 
         assert_eq!(config.core.scratchpad, ".custom/scratch.md");
         assert_eq!(config.core.specs_dir, "./specs/"); // Unchanged
+    }
+
+    /// Regression test for prompt_summary reading file content instead of path.
+    ///
+    /// Previously, when prompt_file was used, the prompt_summary would just
+    /// return the file path string. This caused confusing error messages like
+    /// "Configuration file not found at con..." when the path was displayed.
+    ///
+    /// The fix ensures prompt_summary reads the actual file content.
+    #[test]
+    fn test_prompt_summary_reads_file_content_not_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompt_path = temp_dir.path().join("PROMPT.md");
+        let prompt_content = "Build a feature that does amazing things";
+
+        // Write the prompt file
+        std::fs::write(&prompt_path, prompt_content).unwrap();
+
+        // Create config with prompt_file set
+        let mut config = RalphConfig::default();
+        config.event_loop.prompt_file = prompt_path.to_string_lossy().to_string();
+        config.event_loop.prompt = None;
+
+        // Simulate the prompt_summary logic from run_command
+        let prompt_summary = config
+            .event_loop
+            .prompt
+            .clone()
+            .or_else(|| {
+                let prompt_file = &config.event_loop.prompt_file;
+                if prompt_file.is_empty() {
+                    None
+                } else {
+                    let path = std::path::Path::new(prompt_file);
+                    if path.exists() {
+                        std::fs::read_to_string(path).ok()
+                    } else {
+                        None
+                    }
+                }
+            })
+            .map(|p| {
+                if p.len() > 100 {
+                    format!("{}...", &p[..100])
+                } else {
+                    p
+                }
+            })
+            .unwrap_or_else(|| "[no prompt]".to_string());
+
+        // Assert: summary contains file content, NOT the file path
+        assert_eq!(prompt_summary, prompt_content);
+        assert!(!prompt_summary.contains("PROMPT.md"));
+        assert!(!prompt_summary.contains(&temp_dir.path().to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn test_prompt_summary_truncates_long_content() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompt_path = temp_dir.path().join("LONG_PROMPT.md");
+        let long_content = "X".repeat(150); // 150 chars, exceeds 100 limit
+
+        std::fs::write(&prompt_path, &long_content).unwrap();
+
+        let mut config = RalphConfig::default();
+        config.event_loop.prompt_file = prompt_path.to_string_lossy().to_string();
+        config.event_loop.prompt = None;
+
+        // Simulate the prompt_summary logic
+        let prompt_summary = config
+            .event_loop
+            .prompt
+            .clone()
+            .or_else(|| {
+                let prompt_file = &config.event_loop.prompt_file;
+                if prompt_file.is_empty() {
+                    None
+                } else {
+                    let path = std::path::Path::new(prompt_file);
+                    if path.exists() {
+                        std::fs::read_to_string(path).ok()
+                    } else {
+                        None
+                    }
+                }
+            })
+            .map(|p| {
+                if p.len() > 100 {
+                    format!("{}...", &p[..100])
+                } else {
+                    p
+                }
+            })
+            .unwrap_or_else(|| "[no prompt]".to_string());
+
+        // Assert: truncated to 100 chars + "..."
+        assert_eq!(prompt_summary.len(), 103); // 100 + "..."
+        assert!(prompt_summary.ends_with("..."));
+    }
+
+    #[test]
+    fn test_prompt_summary_returns_no_prompt_for_missing_file() {
+        let mut config = RalphConfig::default();
+        config.event_loop.prompt_file = "/nonexistent/path/PROMPT.md".to_string();
+        config.event_loop.prompt = None;
+
+        // Simulate the prompt_summary logic
+        let prompt_summary = config
+            .event_loop
+            .prompt
+            .clone()
+            .or_else(|| {
+                let prompt_file = &config.event_loop.prompt_file;
+                if prompt_file.is_empty() {
+                    None
+                } else {
+                    let path = std::path::Path::new(prompt_file);
+                    if path.exists() {
+                        std::fs::read_to_string(path).ok()
+                    } else {
+                        None
+                    }
+                }
+            })
+            .map(|p| {
+                if p.len() > 100 {
+                    format!("{}...", &p[..100])
+                } else {
+                    p
+                }
+            })
+            .unwrap_or_else(|| "[no prompt]".to_string());
+
+        // Assert: returns "[no prompt]" for missing file
+        assert_eq!(prompt_summary, "[no prompt]");
     }
 }

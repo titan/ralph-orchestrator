@@ -25,8 +25,8 @@ use tracing::{debug, info, warn};
 ///
 /// This teaches the agent how to read and create memories.
 /// Skill injection is implicit when `memories.enabled: true`.
-/// Embedded from `.claude/skills/ralph-memories/SKILL.md` at compile time.
-const MEMORIES_SKILL: &str = include_str!("../../../../.claude/skills/ralph-memories/SKILL.md");
+/// Embedded from `data/memories-skill.md` at compile time.
+const MEMORIES_SKILL: &str = include_str!("../../data/memories-skill.md");
 
 /// Reason the event loop terminated.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +49,10 @@ pub enum TerminationReason {
     Stopped,
     /// Interrupted by signal (SIGINT/SIGTERM).
     Interrupted,
+    /// Chaos mode completion promise detected.
+    ChaosModeComplete,
+    /// Chaos mode max iterations reached.
+    ChaosModeMaxIterations,
 }
 
 impl TerminationReason {
@@ -61,14 +65,15 @@ impl TerminationReason {
     /// - 130: User interrupt (SIGINT = 128 + 2)
     pub fn exit_code(&self) -> i32 {
         match self {
-            TerminationReason::CompletionPromise => 0,
+            TerminationReason::CompletionPromise | TerminationReason::ChaosModeComplete => 0,
             TerminationReason::ConsecutiveFailures
             | TerminationReason::LoopThrashing
             | TerminationReason::ValidationFailure
             | TerminationReason::Stopped => 1,
             TerminationReason::MaxIterations
             | TerminationReason::MaxRuntime
-            | TerminationReason::MaxCost => 2,
+            | TerminationReason::MaxCost
+            | TerminationReason::ChaosModeMaxIterations => 2,
             TerminationReason::Interrupted => 130,
         }
     }
@@ -88,7 +93,24 @@ impl TerminationReason {
             TerminationReason::ValidationFailure => "validation_failure",
             TerminationReason::Stopped => "stopped",
             TerminationReason::Interrupted => "interrupted",
+            TerminationReason::ChaosModeComplete => "chaos_complete",
+            TerminationReason::ChaosModeMaxIterations => "chaos_max_iterations",
         }
+    }
+
+    /// Returns true if this is a successful completion (not an error or limit).
+    pub fn is_success(&self) -> bool {
+        matches!(
+            self,
+            TerminationReason::CompletionPromise | TerminationReason::ChaosModeComplete
+        )
+    }
+
+    /// Returns true if this termination triggers chaos mode.
+    ///
+    /// Chaos mode ONLY activates after LOOP_COMPLETE - not on other termination reasons.
+    pub fn triggers_chaos_mode(&self) -> bool {
+        matches!(self, TerminationReason::CompletionPromise)
     }
 }
 
@@ -100,7 +122,9 @@ pub struct EventLoop {
     state: LoopState,
     instruction_builder: InstructionBuilder,
     ralph: HatlessRalph,
-    event_reader: EventReader,
+    /// Event reader for consuming events from JSONL file.
+    /// Made pub(crate) to allow tests to override the path.
+    pub(crate) event_reader: EventReader,
     diagnostics: crate::diagnostics::DiagnosticsCollector,
     /// Loop context for path resolution (None for legacy single-loop mode).
     loop_context: Option<LoopContext>,
@@ -177,17 +201,24 @@ impl EventLoop {
             );
         }
 
-        // When memories are enabled, scratchpad instructions are excluded (mutually exclusive)
+        // When memories are enabled, add tasks CLI instructions alongside scratchpad
         let ralph = HatlessRalph::new(
             config.event_loop.completion_promise.clone(),
             config.core.clone(),
             &registry,
             config.event_loop.starting_event.clone(),
         )
-        .with_scratchpad(!config.memories.enabled);
+        .with_memories_enabled(config.memories.enabled);
 
-        // Use LoopContext for events path resolution
-        let events_path = context.events_path();
+        // Read timestamped events path from marker file, fall back to default
+        // The marker file contains a relative path like ".ralph/events-20260127-123456.jsonl"
+        // which we resolve relative to the workspace root
+        let events_path = std::fs::read_to_string(context.current_events_marker())
+            .map(|s| {
+                let relative = s.trim();
+                context.workspace().join(relative)
+            })
+            .unwrap_or_else(|_| context.events_path());
         let event_reader = EventReader::new(&events_path);
 
         Self {
@@ -238,14 +269,14 @@ impl EventLoop {
             );
         }
 
-        // When memories are enabled, scratchpad instructions are excluded (mutually exclusive)
+        // When memories are enabled, add tasks CLI instructions alongside scratchpad
         let ralph = HatlessRalph::new(
             config.event_loop.completion_promise.clone(),
             config.core.clone(),
             &registry,
             config.event_loop.starting_event.clone(),
         )
-        .with_scratchpad(!config.memories.enabled);
+        .with_memories_enabled(config.memories.enabled);
 
         // Read events path from marker file, fall back to default if not present
         // The marker file is written by run_loop_impl() at run startup
@@ -277,7 +308,7 @@ impl EventLoop {
         self.loop_context
             .as_ref()
             .map(|ctx| ctx.tasks_path())
-            .unwrap_or_else(|| PathBuf::from(".agent/tasks.jsonl"))
+            .unwrap_or_else(|| PathBuf::from(".ralph/agent/tasks.jsonl"))
     }
 
     /// Returns the scratchpad path based on loop context or config.
@@ -394,9 +425,11 @@ impl EventLoop {
 
     /// Common initialization logic with configurable topic.
     fn initialize_with_topic(&mut self, topic: &str, prompt_content: &str) {
-        // Per spec: Log hat list, not "mode" terminology
-        // ✅ "Ralph ready with hats: planner, builder"
-        // ❌ "Starting in multi-hat mode"
+        // Store the objective so it persists across all iterations.
+        // After iteration 1, bus.take_pending() consumes the start event,
+        // so without this the objective would be invisible to later hats.
+        self.ralph.set_objective(prompt_content.to_string());
+
         let start_event = Event::new(topic, prompt_content);
         self.bus.publish(start_event);
         debug!(topic = topic, "Published {} event", topic);
@@ -605,7 +638,7 @@ impl EventLoop {
     /// Prepends memories and usage skill to the prompt if auto-injection is enabled.
     ///
     /// Per spec: When `memories.inject: auto` is configured, memories are loaded
-    /// from `.agent/memories.md` and prepended to every prompt.
+    /// from `.ralph/agent/memories.md` and prepended to every prompt.
     fn prepend_memories(&self, prompt: String) -> String {
         let memories_config = &self.config.memories;
 
@@ -626,7 +659,7 @@ impl EventLoop {
         // Load memories from the store using workspace root for path resolution
         let workspace_root = &self.config.core.workspace_root;
         let store = MarkdownMemoryStore::with_default_path(workspace_root);
-        let memories_path = workspace_root.join(".agent/memories.md");
+        let memories_path = workspace_root.join(".ralph/agent/memories.md");
 
         info!(
             "Looking for memories at: {:?} (exists: {})",
@@ -851,6 +884,14 @@ impl EventLoop {
         }
     }
 
+    /// Returns a mutable reference to the event bus for direct event publishing.
+    ///
+    /// This is primarily used for planning sessions to inject user responses
+    /// as events into the orchestration loop.
+    pub fn bus(&mut self) -> &mut EventBus {
+        &mut self.bus
+    }
+
     /// Processes output from a hat execution.
     ///
     /// Returns the termination reason if the loop should stop.
@@ -888,259 +929,43 @@ impl EventLoop {
         }
 
         // Check for completion promise - only valid from Ralph (the coordinator)
-        // Per spec: Requires dual condition (task state + consecutive confirmation)
-        // When memories are enabled, verify tasks instead of scratchpad
+        // Trust the agent's decision to complete - it knows when the objective is done.
+        // Open tasks are logged as a warning but do not block completion.
         if hat_id.as_str() == "ralph"
             && EventParser::contains_promise(output, &self.config.event_loop.completion_promise)
         {
-            let verification_result = if self.config.memories.enabled {
-                self.verify_tasks_complete()
-            } else {
-                self.verify_scratchpad_complete()
-            };
-
-            match verification_result {
-                Ok(true) => {
-                    // All tasks complete - increment confirmation counter
-                    self.state.completion_confirmations += 1;
-
-                    if self.state.completion_confirmations >= 2 {
-                        // Second consecutive confirmation - terminate
-                        info!(
-                            confirmations = self.state.completion_confirmations,
-                            "Completion confirmed on consecutive iterations - terminating"
-                        );
-
-                        // Log loop terminated
-                        self.diagnostics.log_orchestration(
-                            self.state.iteration,
-                            "loop",
-                            crate::diagnostics::OrchestrationEvent::LoopTerminated {
-                                reason: "completion_promise".to_string(),
-                            },
-                        );
-
-                        return Some(TerminationReason::CompletionPromise);
-                    }
-                    // First confirmation - continue to next iteration
-                    info!(
-                        confirmations = self.state.completion_confirmations,
-                        "Completion detected but requires consecutive confirmation - continuing"
-                    );
-                }
-                Ok(false) => {
-                    // Pending tasks exist - reject completion
-                    debug!(
-                        "Completion promise detected but scratchpad has pending [ ] tasks - rejected"
-                    );
-                    self.state.completion_confirmations = 0;
-                }
-                Err(e) => {
-                    // Scratchpad doesn't exist or can't be read - reject completion
-                    debug!(
-                        error = %e,
-                        "Completion promise detected but scratchpad verification failed - rejected"
-                    );
-                    self.state.completion_confirmations = 0;
-                }
-            }
-        }
-
-        // Parse and publish events from output
-        let parser = EventParser::new().with_source(hat_id.clone());
-        let events = parser.parse(output);
-
-        // Validate build.done events have backpressure evidence
-        let mut validated_events = Vec::new();
-        for event in events {
-            if event.topic.as_str() == "build.done" {
-                if let Some(evidence) = EventParser::parse_backpressure_evidence(&event.payload) {
-                    if evidence.all_passed() {
-                        validated_events.push(event);
-                    } else {
-                        // Evidence present but checks failed - synthesize build.blocked
-                        warn!(
-                            hat = %hat_id.as_str(),
-                            tests = evidence.tests_passed,
-                            lint = evidence.lint_passed,
-                            typecheck = evidence.typecheck_passed,
-                            "build.done rejected: backpressure checks failed"
-                        );
-
-                        // Log backpressure triggered
-                        self.diagnostics.log_orchestration(
-                            self.state.iteration,
-                            hat_id.as_str(),
-                            crate::diagnostics::OrchestrationEvent::BackpressureTriggered {
-                                reason: format!(
-                                    "backpressure checks failed: tests={}, lint={}, typecheck={}",
-                                    evidence.tests_passed,
-                                    evidence.lint_passed,
-                                    evidence.typecheck_passed
-                                ),
-                            },
-                        );
-
-                        let blocked = Event::new(
-                            "build.blocked",
-                            "Backpressure checks failed. Fix tests/lint/typecheck before emitting build.done."
-                        ).with_source(hat_id.clone());
-                        validated_events.push(blocked);
-                    }
-                } else {
-                    // No evidence found - synthesize build.blocked
+            // Log warning if tasks remain open (informational only)
+            if self.config.memories.enabled {
+                if let Ok(false) = self.verify_tasks_complete() {
+                    let open_tasks = self.get_open_task_list();
                     warn!(
-                        hat = %hat_id.as_str(),
-                        "build.done rejected: missing backpressure evidence"
+                        open_tasks = ?open_tasks,
+                        "LOOP_COMPLETE with {} open task(s) - trusting agent decision",
+                        open_tasks.len()
                     );
-
-                    // Log backpressure triggered
-                    self.diagnostics.log_orchestration(
-                        self.state.iteration,
-                        hat_id.as_str(),
-                        crate::diagnostics::OrchestrationEvent::BackpressureTriggered {
-                            reason: "missing backpressure evidence".to_string(),
-                        },
-                    );
-
-                    let blocked = Event::new(
-                        "build.blocked",
-                        "Missing backpressure evidence. Include 'tests: pass', 'lint: pass', 'typecheck: pass' in build.done payload."
-                    ).with_source(hat_id.clone());
-                    validated_events.push(blocked);
                 }
-            } else {
-                validated_events.push(event);
+            } else if let Ok(false) = self.verify_scratchpad_complete() {
+                warn!("LOOP_COMPLETE with pending scratchpad tasks - trusting agent decision");
             }
-        }
 
-        // Track build.blocked events for task-level thrashing detection
-        let blocked_events: Vec<_> = validated_events
-            .iter()
-            .filter(|e| e.topic == "build.blocked".into())
-            .collect();
+            // Trust the agent - terminate immediately
+            info!("LOOP_COMPLETE detected - terminating");
 
-        for blocked_event in &blocked_events {
-            // Extract task ID from first line of payload
-            let task_id = Self::extract_task_id(&blocked_event.payload);
-
-            // Increment block count for this task
-            let count = self
-                .state
-                .task_block_counts
-                .entry(task_id.clone())
-                .or_insert(0);
-            *count += 1;
-
-            debug!(
-                task_id = %task_id,
-                block_count = *count,
-                "Task blocked"
-            );
-
-            // After 3 blocks on same task, emit build.task.abandoned
-            if *count >= 3 && !self.state.abandoned_tasks.contains(&task_id) {
-                warn!(
-                    task_id = %task_id,
-                    "Task abandoned after 3 consecutive blocks"
-                );
-
-                self.state.abandoned_tasks.push(task_id.clone());
-
-                // Log task abandoned
-                self.diagnostics.log_orchestration(
-                    self.state.iteration,
-                    hat_id.as_str(),
-                    crate::diagnostics::OrchestrationEvent::TaskAbandoned {
-                        reason: format!(
-                            "3 consecutive build.blocked events for task '{}'",
-                            task_id
-                        ),
-                    },
-                );
-
-                let abandoned_event = Event::new(
-                    "build.task.abandoned",
-                    format!(
-                        "Task '{}' abandoned after 3 consecutive build.blocked events",
-                        task_id
-                    ),
-                )
-                .with_source(hat_id.clone());
-
-                self.bus.publish(abandoned_event);
-            }
-        }
-
-        // Track build.task events to detect redispatch of abandoned tasks
-        let task_events: Vec<_> = validated_events
-            .iter()
-            .filter(|e| e.topic == "build.task".into())
-            .collect();
-
-        for task_event in task_events {
-            let task_id = Self::extract_task_id(&task_event.payload);
-
-            // Check if this task was already abandoned
-            if self.state.abandoned_tasks.contains(&task_id) {
-                self.state.abandoned_task_redispatches += 1;
-                warn!(
-                    task_id = %task_id,
-                    redispatch_count = self.state.abandoned_task_redispatches,
-                    "Planner redispatched abandoned task"
-                );
-            } else {
-                // Reset redispatch counter on non-abandoned task
-                self.state.abandoned_task_redispatches = 0;
-            }
-        }
-
-        // Track hat-level blocking for legacy thrashing detection
-        let has_blocked_event = !blocked_events.is_empty();
-
-        if has_blocked_event {
-            // Check if same hat as last blocked event
-            if self.state.last_blocked_hat.as_ref() == Some(hat_id) {
-                self.state.consecutive_blocked += 1;
-            } else {
-                self.state.consecutive_blocked = 1;
-                self.state.last_blocked_hat = Some(hat_id.clone());
-            }
-        } else {
-            // Reset counter on any non-blocked event
-            self.state.consecutive_blocked = 0;
-            self.state.last_blocked_hat = None;
-        }
-
-        for event in validated_events {
-            debug!(
-                topic = %event.topic,
-                source = ?event.source,
-                target = ?event.target,
-                "Publishing event from output"
-            );
-            let topic = event.topic.clone();
-
-            // Log event published
+            // Log loop terminated
             self.diagnostics.log_orchestration(
                 self.state.iteration,
-                hat_id.as_str(),
-                crate::diagnostics::OrchestrationEvent::EventPublished {
-                    topic: topic.to_string(),
+                "loop",
+                crate::diagnostics::OrchestrationEvent::LoopTerminated {
+                    reason: "completion_promise".to_string(),
                 },
             );
 
-            let recipients = self.bus.publish(event);
-
-            // Per spec: "Unknown topic → Log warning, event dropped"
-            if recipients.is_empty() {
-                warn!(
-                    topic = %topic,
-                    source = %hat_id.as_str(),
-                    "Event has no subscribers - will be dropped. Check hat triggers configuration."
-                );
-            }
+            return Some(TerminationReason::CompletionPromise);
         }
+
+        // Events are ONLY read from the JSONL file written by `ralph emit`.
+        // This enforces tool use and prevents confabulation (agent claiming to emit without actually doing so).
+        // See process_events_from_jsonl() for event processing.
 
         // Check termination conditions
         self.check_termination()
@@ -1198,7 +1023,22 @@ impl EventLoop {
         }
 
         let store = TaskStore::load(&tasks_path)?;
-        Ok(!store.has_open_tasks())
+        Ok(!store.has_pending_tasks())
+    }
+
+    /// Returns a list of open task descriptions for logging purposes.
+    fn get_open_task_list(&self) -> Vec<String> {
+        use crate::task_store::TaskStore;
+
+        let tasks_path = self.tasks_path();
+        if let Ok(store) = TaskStore::load(&tasks_path) {
+            return store
+                .open()
+                .iter()
+                .map(|t| format!("{}: {}", t.id, t.title))
+                .collect();
+        }
+        vec![]
     }
 
     /// Processes events from JSONL and routes orphaned events to Ralph.
@@ -1239,16 +1079,148 @@ impl EventLoop {
 
         let mut has_orphans = false;
 
+        // Validate and transform events (apply backpressure for build.done)
+        let mut validated_events = Vec::new();
         for event in result.events {
-            // Check if any hat subscribes to this event
-            if self.registry.has_subscriber(&event.topic) {
-                // Route to subscriber via EventBus
-                let proto_event = if let Some(payload) = event.payload {
-                    Event::new(event.topic.as_str(), &payload)
+            let payload = event.payload.clone().unwrap_or_default();
+
+            if event.topic == "build.done" {
+                // Validate build.done events have backpressure evidence
+                if let Some(evidence) = EventParser::parse_backpressure_evidence(&payload) {
+                    if evidence.all_passed() {
+                        validated_events.push(Event::new(event.topic.as_str(), &payload));
+                    } else {
+                        // Evidence present but checks failed - synthesize build.blocked
+                        warn!(
+                            tests = evidence.tests_passed,
+                            lint = evidence.lint_passed,
+                            typecheck = evidence.typecheck_passed,
+                            "build.done rejected: backpressure checks failed"
+                        );
+
+                        self.diagnostics.log_orchestration(
+                            self.state.iteration,
+                            "jsonl",
+                            crate::diagnostics::OrchestrationEvent::BackpressureTriggered {
+                                reason: format!(
+                                    "backpressure checks failed: tests={}, lint={}, typecheck={}",
+                                    evidence.tests_passed,
+                                    evidence.lint_passed,
+                                    evidence.typecheck_passed
+                                ),
+                            },
+                        );
+
+                        validated_events.push(Event::new(
+                            "build.blocked",
+                            "Backpressure checks failed. Fix tests/lint/typecheck before emitting build.done.",
+                        ));
+                    }
                 } else {
-                    Event::new(event.topic.as_str(), "")
-                };
-                self.bus.publish(proto_event);
+                    // No evidence found - synthesize build.blocked
+                    warn!("build.done rejected: missing backpressure evidence");
+
+                    self.diagnostics.log_orchestration(
+                        self.state.iteration,
+                        "jsonl",
+                        crate::diagnostics::OrchestrationEvent::BackpressureTriggered {
+                            reason: "missing backpressure evidence".to_string(),
+                        },
+                    );
+
+                    validated_events.push(Event::new(
+                        "build.blocked",
+                        "Missing backpressure evidence. Include 'tests: pass', 'lint: pass', 'typecheck: pass' in build.done payload.",
+                    ));
+                }
+            } else {
+                // Non-build.done events pass through unchanged
+                validated_events.push(Event::new(event.topic.as_str(), &payload));
+            }
+        }
+
+        // Track build.blocked events for thrashing detection
+        let blocked_events: Vec<_> = validated_events
+            .iter()
+            .filter(|e| e.topic == "build.blocked".into())
+            .collect();
+
+        for blocked_event in &blocked_events {
+            let task_id = Self::extract_task_id(&blocked_event.payload);
+
+            let count = self
+                .state
+                .task_block_counts
+                .entry(task_id.clone())
+                .or_insert(0);
+            *count += 1;
+
+            debug!(
+                task_id = %task_id,
+                block_count = *count,
+                "Task blocked"
+            );
+
+            // After 3 blocks on same task, emit build.task.abandoned
+            if *count >= 3 && !self.state.abandoned_tasks.contains(&task_id) {
+                warn!(
+                    task_id = %task_id,
+                    "Task abandoned after 3 consecutive blocks"
+                );
+
+                self.state.abandoned_tasks.push(task_id.clone());
+
+                self.diagnostics.log_orchestration(
+                    self.state.iteration,
+                    "jsonl",
+                    crate::diagnostics::OrchestrationEvent::TaskAbandoned {
+                        reason: format!(
+                            "3 consecutive build.blocked events for task '{}'",
+                            task_id
+                        ),
+                    },
+                );
+
+                let abandoned_event = Event::new(
+                    "build.task.abandoned",
+                    format!(
+                        "Task '{}' abandoned after 3 consecutive build.blocked events",
+                        task_id
+                    ),
+                );
+
+                self.bus.publish(abandoned_event);
+            }
+        }
+
+        // Track hat-level blocking for legacy thrashing detection
+        let has_blocked_event = !blocked_events.is_empty();
+
+        if has_blocked_event {
+            self.state.consecutive_blocked += 1;
+        } else {
+            self.state.consecutive_blocked = 0;
+            self.state.last_blocked_hat = None;
+        }
+
+        // Publish validated events
+        for event in validated_events {
+            // Log all events from JSONL (whether orphaned or not)
+            self.diagnostics.log_orchestration(
+                self.state.iteration,
+                "jsonl",
+                crate::diagnostics::OrchestrationEvent::EventPublished {
+                    topic: event.topic.to_string(),
+                },
+            );
+
+            // Check if any hat subscribes to this event
+            if self.registry.has_subscriber(event.topic.as_str()) {
+                debug!(
+                    topic = %event.topic,
+                    "Publishing event from JSONL"
+                );
+                self.bus.publish(event);
             } else {
                 // Orphaned event - Ralph will handle it
                 debug!(
@@ -1305,6 +1277,192 @@ impl EventLoop {
 
         event
     }
+
+    // -------------------------------------------------------------------------
+    // Human-in-the-loop planning support
+    // -------------------------------------------------------------------------
+
+    /// Check if any event is a `user.prompt` event.
+    ///
+    /// Returns the first user prompt event found, or None.
+    pub fn check_for_user_prompt(&self, events: &[Event]) -> Option<UserPrompt> {
+        events
+            .iter()
+            .find(|e| e.topic.as_str() == "user.prompt")
+            .map(|e| UserPrompt {
+                id: Self::extract_prompt_id(&e.payload),
+                text: e.payload.clone(),
+            })
+    }
+
+    /// Extract a prompt ID from the event payload.
+    ///
+    /// Supports both XML attribute format: `<event topic="user.prompt" id="q1">...</event>`
+    /// and JSON format in payload.
+    fn extract_prompt_id(payload: &str) -> String {
+        // Try to extract id attribute from XML-like format first
+        if let Some(start) = payload.find("id=\"")
+            && let Some(end) = payload[start + 4..].find('"')
+        {
+            return payload[start + 4..start + 4 + end].to_string();
+        }
+
+        // Fallback: generate a simple ID based on timestamp
+        format!("q{}", Self::generate_prompt_id())
+    }
+
+    /// Generate a simple unique ID for prompts.
+    /// Uses timestamp-based generation since uuid crate isn't available.
+    fn generate_prompt_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{:x}", nanos % 0xFFFF_FFFF)
+    }
+}
+
+/// A user prompt that requires human input.
+///
+/// Created when the agent emits a `user.prompt` event during planning.
+#[derive(Debug, Clone)]
+pub struct UserPrompt {
+    /// Unique identifier for this prompt (e.g., "q1", "q2")
+    pub id: String,
+    /// The prompt/question text
+    pub text: String,
+}
+
+/// Error that can occur while waiting for user response.
+#[derive(Debug, thiserror::Error)]
+pub enum UserPromptError {
+    #[error("Timeout waiting for user response")]
+    Timeout,
+
+    #[error("Interrupted while waiting for user response")]
+    Interrupted,
+
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Wait for a user response to a specific prompt (async version).
+///
+/// This function polls the conversation file for a matching response entry.
+/// It's designed to be called from async code when a user.prompt event is detected.
+///
+/// # Arguments
+///
+/// * `conversation_path` - Path to the conversation JSONL file
+/// * `prompt_id` - The ID of the prompt we're waiting for
+/// * `timeout_secs` - Maximum time to wait in seconds
+/// * `interrupt_rx` - Optional channel to check for interruption
+///
+/// # Returns
+///
+/// The user's response text if found within the timeout period.
+#[allow(dead_code)]
+pub async fn wait_for_user_response_async(
+    conversation_path: &std::path::Path,
+    prompt_id: &str,
+    timeout_secs: u64,
+    mut interrupt_rx: Option<&mut tokio::sync::watch::Receiver<bool>>,
+) -> Result<String, UserPromptError> {
+    use tokio::time::{Duration, sleep, timeout};
+
+    let poll_interval = Duration::from_millis(100);
+
+    let result = timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            // Check for interruption
+            if let Some(rx) = &mut interrupt_rx
+                && *rx.borrow()
+            {
+                return Err(UserPromptError::Interrupted);
+            }
+
+            // Poll for response
+            if let Some(response) = find_response_in_file(conversation_path, prompt_id)? {
+                return Ok(response);
+            }
+
+            // Wait before next poll
+            sleep(poll_interval).await;
+        }
+    })
+    .await;
+
+    match result {
+        Ok(r) => r,
+        Err(_) => Err(UserPromptError::Timeout),
+    }
+}
+
+/// Wait for a user response to a specific prompt (sync version).
+///
+/// This function polls the conversation file for a matching response entry.
+/// It's designed to be called from the CLI layer when a user.prompt event is detected.
+///
+/// # Arguments
+///
+/// * `conversation_path` - Path to the conversation JSONL file
+/// * `prompt_id` - The ID of the prompt we're waiting for
+/// * `timeout_secs` - Maximum time to wait in seconds
+///
+/// # Returns
+///
+/// The user's response text if found within the timeout period.
+#[allow(dead_code)]
+pub fn wait_for_user_response(
+    conversation_path: &std::path::Path,
+    prompt_id: &str,
+    timeout_secs: u64,
+) -> Result<String, UserPromptError> {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let poll_interval = Duration::from_millis(100);
+
+    loop {
+        // Check for timeout
+        if Instant::now() >= deadline {
+            return Err(UserPromptError::Timeout);
+        }
+
+        // Poll for response
+        if let Some(response) = find_response_in_file(conversation_path, prompt_id)? {
+            return Ok(response);
+        }
+
+        // Wait before next poll
+        thread::sleep(poll_interval);
+    }
+}
+
+/// Search for a response to a specific prompt in the conversation file.
+#[allow(dead_code)]
+fn find_response_in_file(
+    conversation_path: &std::path::Path,
+    prompt_id: &str,
+) -> Result<Option<String>, UserPromptError> {
+    if !conversation_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(conversation_path)?;
+
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<crate::planning_session::ConversationEntry>(line)
+            && entry.entry_type == crate::planning_session::ConversationType::UserResponse
+            && entry.id == prompt_id
+        {
+            return Ok(Some(entry.text));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Formats a duration as human-readable string.
@@ -1337,5 +1495,7 @@ fn termination_status_text(reason: &TerminationReason) -> &'static str {
         TerminationReason::ValidationFailure => "Too many consecutive malformed JSONL events.",
         TerminationReason::Stopped => "Manually stopped.",
         TerminationReason::Interrupted => "Interrupted by signal.",
+        TerminationReason::ChaosModeComplete => "Chaos mode exploration complete.",
+        TerminationReason::ChaosModeMaxIterations => "Chaos mode stopped at iteration limit.",
     }
 }

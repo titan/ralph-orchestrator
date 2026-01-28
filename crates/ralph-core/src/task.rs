@@ -15,6 +15,17 @@ pub enum TaskStatus {
     InProgress,
     /// Complete
     Closed,
+    /// Failed/abandoned
+    Failed,
+}
+
+impl TaskStatus {
+    /// Returns true if this status is terminal (Closed or Failed).
+    ///
+    /// Terminal statuses indicate the task is done and no longer needs attention.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, TaskStatus::Closed | TaskStatus::Failed)
+    }
 }
 
 /// A task in the task tracking system.
@@ -40,6 +51,11 @@ pub struct Task {
     #[serde(default)]
     pub blocked_by: Vec<String>,
 
+    /// Loop ID that created this task (from RALPH_LOOP_ID env var).
+    /// Used to filter tasks by ownership when multiple loops share a task list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_id: Option<String>,
+
     /// Creation timestamp (ISO 8601)
     pub created: String,
 
@@ -58,9 +74,16 @@ impl Task {
             status: TaskStatus::Open,
             priority: priority.clamp(1, 5),
             blocked_by: Vec::new(),
+            loop_id: None,
             created: chrono::Utc::now().to_rfc3339(),
             closed: None,
         }
+    }
+
+    /// Sets the loop ID for this task.
+    pub fn with_loop_id(mut self, loop_id: Option<String>) -> Self {
+        self.loop_id = loop_id;
+        self
     }
 
     /// Generates a unique task ID: task-{timestamp}-{hex_suffix}
@@ -164,5 +187,16 @@ mod tests {
 
         task.status = TaskStatus::InProgress;
         assert!(!task.is_ready(&[]));
+
+        task.status = TaskStatus::Failed;
+        assert!(!task.is_ready(&[]));
+    }
+
+    #[test]
+    fn test_is_terminal() {
+        assert!(!TaskStatus::Open.is_terminal());
+        assert!(!TaskStatus::InProgress.is_terminal());
+        assert!(TaskStatus::Closed.is_terminal());
+        assert!(TaskStatus::Failed.is_terminal());
     }
 }

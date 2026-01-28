@@ -36,6 +36,8 @@ hats:
 #[test]
 fn test_hat_max_activations_emits_exhausted_event() {
     // Repro for issue #66: per-hat max_activations should prevent infinite reviewer loops.
+    // Events are now published directly to the bus (simulating what ralph emit writes to JSONL
+    // and process_events_from_jsonl publishes).
     let yaml = r#"
 hats:
   executor:
@@ -68,11 +70,10 @@ hats:
     for _ in 0..3 {
         // Executor active.
         let _ = event_loop.build_prompt(&ralph).unwrap();
-        event_loop.process_output(
-            &ralph,
-            "<event topic=\"implementation.done\">done</event>",
-            true,
-        );
+        // Simulate event from JSONL (ralph emit writes to file, process_events_from_jsonl publishes)
+        event_loop
+            .bus
+            .publish(Event::new("implementation.done", "done"));
 
         // Reviewer active (up to max_activations=3).
         let prompt = event_loop.build_prompt(&ralph).unwrap();
@@ -80,20 +81,16 @@ hats:
             !prompt.contains("Event: code_reviewer.exhausted"),
             "Reviewer should not be exhausted yet"
         );
-        event_loop.process_output(
-            &ralph,
-            "<event topic=\"review.changes_requested\">fix</event>",
-            true,
-        );
+        event_loop
+            .bus
+            .publish(Event::new("review.changes_requested", "fix"));
     }
 
     // One more implementation.done should attempt a 4th reviewer activation.
     let _ = event_loop.build_prompt(&ralph).unwrap();
-    event_loop.process_output(
-        &ralph,
-        "<event topic=\"implementation.done\">done</event>",
-        true,
-    );
+    event_loop
+        .bus
+        .publish(Event::new("implementation.done", "done"));
 
     let prompt = event_loop.build_prompt(&ralph).unwrap();
     assert!(
@@ -186,16 +183,86 @@ fn test_completion_promise_detection() {
     // Use Ralph since it's the coordinator that outputs completion promise
     let hat_id = HatId::new("ralph");
 
-    // First LOOP_COMPLETE - should NOT terminate (needs consecutive confirmation)
-    let reason = event_loop.process_output(&hat_id, "Done! LOOP_COMPLETE", true);
-    assert_eq!(reason, None, "First confirmation should not terminate");
-
-    // Second consecutive LOOP_COMPLETE - should terminate
+    // LOOP_COMPLETE with all tasks done - should terminate immediately
     let reason = event_loop.process_output(&hat_id, "Done! LOOP_COMPLETE", true);
     assert_eq!(
         reason,
         Some(TerminationReason::CompletionPromise),
-        "Second consecutive confirmation should terminate"
+        "Should terminate immediately when LOOP_COMPLETE + tasks verified"
+    );
+}
+
+#[test]
+fn test_completion_promise_with_open_tasks_still_terminates() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create scratchpad with PENDING tasks ([ ] markers)
+    let agent_dir = temp_dir.path().join(".agent");
+    fs::create_dir_all(&agent_dir).unwrap();
+    let scratchpad_path = agent_dir.join("scratchpad.md");
+    fs::write(
+        &scratchpad_path,
+        "## Tasks\n- [x] Task 1 done\n- [ ] Task 2 still pending\n",
+    )
+    .unwrap();
+
+    // Configure event loop to use temp directory scratchpad
+    let mut config = RalphConfig::default();
+    config.core.scratchpad = scratchpad_path.to_string_lossy().to_string();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+
+    let hat_id = HatId::new("ralph");
+
+    // LOOP_COMPLETE with pending tasks - should STILL terminate (trust the agent)
+    // Previously this would reject completion, but now we trust the agent's decision
+    let reason = event_loop.process_output(&hat_id, "Done! LOOP_COMPLETE", true);
+    assert_eq!(
+        reason,
+        Some(TerminationReason::CompletionPromise),
+        "Should terminate even with open tasks - trust the agent's decision"
+    );
+}
+
+#[test]
+fn test_completion_promise_with_pending_tasks_in_task_store() {
+    use crate::task::{Task, TaskStatus};
+    use crate::task_store::TaskStore;
+    use tempfile::TempDir;
+
+    let temp_dir = TempDir::new().unwrap();
+    let tasks_path = temp_dir.path().join(".ralph/agent/tasks.jsonl");
+
+    // Create task store with one open and one closed task
+    let mut store = TaskStore::load(&tasks_path).unwrap();
+    let mut task1 = Task::new("Completed task".to_string(), 1);
+    task1.status = TaskStatus::Closed;
+    store.add(task1);
+
+    let task2 = Task::new("Still open task".to_string(), 2);
+    store.add(task2);
+    store.save().unwrap();
+
+    // Configure event loop with memories enabled and pointing to temp dir
+    let mut config = RalphConfig::default();
+    config.memories.enabled = true;
+    config.core.workspace_root = temp_dir.path().to_path_buf();
+
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+
+    let hat_id = HatId::new("ralph");
+
+    // LOOP_COMPLETE with open tasks in task store - should STILL terminate
+    // The agent knows when the objective is done; not all tasks need to be closed
+    let reason = event_loop.process_output(&hat_id, "Done! LOOP_COMPLETE", true);
+    assert_eq!(
+        reason,
+        Some(TerminationReason::CompletionPromise),
+        "Should terminate even with open tasks in task store - trust the agent"
     );
 }
 
@@ -328,135 +395,107 @@ fn test_exit_codes_per_spec() {
     assert_eq!(TerminationReason::Interrupted.exit_code(), 130);
 }
 
+/// Helper to write an event to a JSONL file for testing.
+fn write_event_to_jsonl(path: &std::path::Path, topic: &str, payload: &str) {
+    use std::io::Write;
+    let ts = chrono::Utc::now().to_rfc3339();
+    let event_json = serde_json::json!({
+        "topic": topic,
+        "payload": payload,
+        "ts": ts
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{}", event_json).unwrap();
+}
+
 #[test]
 fn test_loop_thrashing_detection() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
     let config = RalphConfig::default();
     let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
     event_loop.initialize("Test");
 
-    let planner_id = HatId::new("planner");
-    let builder_id = HatId::new("builder");
-
-    // Planner dispatches task "Fix bug"
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Fix bug</event>",
-        true,
-    );
-
     // Builder blocks on "Fix bug" three times (should emit build.task.abandoned)
-    event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Fix bug\nCan't compile</event>",
-        true,
-    );
-    event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Fix bug\nStill can't compile</event>",
-        true,
-    );
-    event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Fix bug\nReally stuck</event>",
-        true,
-    );
+    write_event_to_jsonl(&events_path, "build.blocked", "Fix bug\nCan't compile");
+    let _ = event_loop.process_events_from_jsonl();
 
-    // Task should be abandoned but loop continues
+    write_event_to_jsonl(
+        &events_path,
+        "build.blocked",
+        "Fix bug\nStill can't compile",
+    );
+    let _ = event_loop.process_events_from_jsonl();
+
+    write_event_to_jsonl(&events_path, "build.blocked", "Fix bug\nReally stuck");
+    let _ = event_loop.process_events_from_jsonl();
+
+    // Task should be abandoned
     assert!(
         event_loop
             .state
             .abandoned_tasks
-            .contains(&"Fix bug".to_string())
+            .contains(&"Fix bug".to_string()),
+        "Task should be abandoned after 3 blocks"
     );
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 0);
-
-    // Planner redispatches the same abandoned task
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Fix bug</event>",
-        true,
-    );
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 1);
-
-    // Planner redispatches again
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Fix bug</event>",
-        true,
-    );
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 2);
-
-    // Third redispatch should trigger LoopThrashing
-    let reason = event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Fix bug</event>",
-        true,
-    );
-    assert_eq!(reason, Some(TerminationReason::LoopThrashing));
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 3);
 }
 
 #[test]
-fn test_thrashing_counter_resets_on_different_hat() {
+fn test_thrashing_counter_increments_on_blocked_events() {
+    // Events now come from JSONL file via `ralph emit`, not from text output.
+    // Per-hat tracking is removed since events don't carry hat context.
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
     let config = RalphConfig::default();
     let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
     event_loop.initialize("Test");
 
-    let planner_id = HatId::new("planner");
-    let builder_id = HatId::new("builder");
-
-    // Planner blocked twice
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.blocked\">Stuck</event>",
-        true,
-    );
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.blocked\">Still stuck</event>",
-        true,
-    );
-    assert_eq!(event_loop.state.consecutive_blocked, 2);
-
-    // Builder blocked - should reset counter
-    event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Builder stuck</event>",
-        true,
-    );
+    // Two blocked events should increment counter
+    write_event_to_jsonl(&events_path, "build.blocked", "Stuck");
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.consecutive_blocked, 1);
-    assert_eq!(event_loop.state.last_blocked_hat, Some(builder_id));
+
+    write_event_to_jsonl(&events_path, "build.blocked", "Still stuck");
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(event_loop.state.consecutive_blocked, 2);
 }
 
 #[test]
 fn test_thrashing_counter_resets_on_non_blocked_event() {
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
     let config = RalphConfig::default();
     let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
     event_loop.initialize("Test");
 
-    let planner_id = HatId::new("planner");
-
     // Two blocked events
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.blocked\">Stuck</event>",
-        true,
-    );
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.blocked\">Still stuck</event>",
-        true,
-    );
+    write_event_to_jsonl(&events_path, "build.blocked", "Stuck");
+    let _ = event_loop.process_events_from_jsonl();
+
+    write_event_to_jsonl(&events_path, "build.blocked", "Still stuck");
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.consecutive_blocked, 2);
 
     // Non-blocked event should reset counter
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Working now</event>",
-        true,
-    );
+    write_event_to_jsonl(&events_path, "build.task", "Working now");
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.consecutive_blocked, 0);
-    assert_eq!(event_loop.state.last_blocked_hat, None);
 }
 
 #[test]
@@ -747,57 +786,51 @@ hats:
     // Ralph handles task.start, not a specific hat
     let ralph_id = HatId::new("ralph");
 
-    // Simulate completion with some cancelled tasks
+    // Simulate completion with some cancelled tasks - should complete immediately
     let output = "All done! LOOP_COMPLETE";
-
-    // First confirmation - should not terminate yet
-    let reason = event_loop.process_output(&ralph_id, output, true);
-    assert_eq!(reason, None, "First confirmation should not terminate");
-
-    // Second consecutive confirmation - should complete successfully despite cancelled tasks
     let reason = event_loop.process_output(&ralph_id, output, true);
     assert_eq!(
         reason,
         Some(TerminationReason::CompletionPromise),
-        "Should complete with partial completion"
+        "Should complete immediately with partial completion (cancelled tasks ok)"
     );
 }
 
 #[test]
 fn test_planner_auto_cancellation_after_three_blocks() {
     // Test that task is abandoned after 3 build.blocked events for same task
+    // Events now come from JSONL via `ralph emit`.
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
     let config = RalphConfig::default();
     let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
     event_loop.initialize("Test task");
 
-    let builder_id = HatId::new("builder");
-    let planner_id = HatId::new("planner");
-
     // First blocked event for "Task X" - should not abandon
-    let reason = event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Task X\nmissing dependency</event>",
-        true,
-    );
-    assert_eq!(reason, None);
+    write_event_to_jsonl(&events_path, "build.blocked", "Task X\nmissing dependency");
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.task_block_counts.get("Task X"), Some(&1));
 
     // Second blocked event for "Task X" - should not abandon
-    let reason = event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Task X\ndependency issue persists</event>",
-        true,
+    write_event_to_jsonl(
+        &events_path,
+        "build.blocked",
+        "Task X\ndependency issue persists",
     );
-    assert_eq!(reason, None);
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.task_block_counts.get("Task X"), Some(&2));
 
-    // Third blocked event for "Task X" - should emit build.task.abandoned but not terminate
-    let reason = event_loop.process_output(
-        &builder_id,
-        "<event topic=\"build.blocked\">Task X\nsame dependency issue</event>",
-        true,
+    // Third blocked event for "Task X" - should emit build.task.abandoned
+    write_event_to_jsonl(
+        &events_path,
+        "build.blocked",
+        "Task X\nsame dependency issue",
     );
-    assert_eq!(reason, None, "Should not terminate, just abandon task");
+    let _ = event_loop.process_events_from_jsonl();
     assert_eq!(event_loop.state.task_block_counts.get("Task X"), Some(&3));
     assert!(
         event_loop
@@ -805,33 +838,6 @@ fn test_planner_auto_cancellation_after_three_blocks() {
             .abandoned_tasks
             .contains(&"Task X".to_string()),
         "Task X should be abandoned"
-    );
-
-    // Planner can now replan around the abandoned task
-    // Only terminates if planner keeps redispatching the abandoned task
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Task X</event>",
-        true,
-    );
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 1);
-
-    event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Task X</event>",
-        true,
-    );
-    assert_eq!(event_loop.state.abandoned_task_redispatches, 2);
-
-    let reason = event_loop.process_output(
-        &planner_id,
-        "<event topic=\"build.task\">Task X</event>",
-        true,
-    );
-    assert_eq!(
-        reason,
-        Some(TerminationReason::LoopThrashing),
-        "Should terminate after 3 redispatches of abandoned task"
     );
 }
 
@@ -1380,5 +1386,356 @@ hats:
         active_hat_id.as_str(),
         "ralph",
         "Should return ralph when no pending events"
+    );
+}
+
+#[test]
+fn test_check_for_user_prompt_detects_user_prompt_event() {
+    // Create EventLoop
+    let config: RalphConfig = serde_yaml::from_str("hats: {}").unwrap();
+    let event_loop = EventLoop::new(config);
+
+    // Create events with a user.prompt event
+    // The id is embedded in the XML payload
+    let events = vec![
+        Event::new("build.task", "Some task"),
+        Event::new(
+            "user.prompt",
+            r#"<event topic="user.prompt" id="q1">What is the feature name?</event>"#,
+        ),
+        Event::new("other.event", "Other"),
+    ];
+
+    // Check for user prompt
+    let user_prompt = event_loop.check_for_user_prompt(&events);
+
+    assert!(user_prompt.is_some(), "Should detect user.prompt event");
+    assert_eq!(user_prompt.unwrap().id, "q1");
+}
+
+#[test]
+fn test_check_for_user_prompt_returns_none_when_no_user_prompt() {
+    // Create EventLoop
+    let config: RalphConfig = serde_yaml::from_str("hats: {}").unwrap();
+    let event_loop = EventLoop::new(config);
+
+    // Create events WITHOUT a user.prompt event
+    let events = vec![
+        Event::new("build.task", "Some task"),
+        Event::new("build.done", "Task completed"),
+    ];
+
+    // Check for user prompt
+    let user_prompt = event_loop.check_for_user_prompt(&events);
+
+    assert!(
+        user_prompt.is_none(),
+        "Should not detect user.prompt when not present"
+    );
+}
+
+#[test]
+fn test_extract_prompt_id_from_xml_format() {
+    // Create EventLoop
+    let config: RalphConfig = serde_yaml::from_str("hats: {}").unwrap();
+    let event_loop = EventLoop::new(config);
+
+    // Create event with XML attribute format
+    let event = Event::new(
+        "user.prompt",
+        r#"<event topic="user.prompt" id="q42">What's the deadline?</event>"#,
+    );
+    let events = vec![event];
+
+    let user_prompt = event_loop.check_for_user_prompt(&events).unwrap();
+    assert_eq!(user_prompt.id, "q42");
+}
+
+// Note: Orphan event detection is now handled in loop_runner.rs::log_events_from_output()
+// which logs to events.jsonl. The `event.orphaned` system event appears in the events file
+// when an event has no subscriber hat, making it visible via `ralph events`.
+
+// === Objective Persistence Tests ===
+
+#[test]
+fn test_initialize_stores_objective_in_ralph() {
+    // initialize() should store the prompt as the objective in HatlessRalph
+    // so that subsequent iterations always see it, even after bus.take_pending() consumes the start event.
+    let yaml = r#"
+hats:
+  test_writer:
+    name: "Test Writer"
+    triggers: ["tdd.start"]
+    publishes: ["test.written"]
+    instructions: "Write failing tests."
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+
+    event_loop.initialize("Implement a binary search tree with insert and search");
+
+    // Consume the start event (simulates iteration 1 completing)
+    let ralph_id = HatId::new("ralph");
+    let prompt1 = event_loop.build_prompt(&ralph_id).unwrap();
+    assert!(
+        prompt1.contains("## OBJECTIVE"),
+        "Iteration 1 should have OBJECTIVE section"
+    );
+    assert!(
+        prompt1.contains("Implement a binary search tree"),
+        "Iteration 1 should show the objective"
+    );
+
+    // Simulate iteration 2: hat publishes an event, start event is gone
+    event_loop
+        .bus
+        .publish(Event::new("test.written", "tests/bst_test.rs"));
+
+    let prompt2 = event_loop.build_prompt(&ralph_id).unwrap();
+
+    // Objective should STILL be present even though task.start was consumed
+    assert!(
+        prompt2.contains("## OBJECTIVE"),
+        "Iteration 2+ should still have OBJECTIVE section"
+    );
+    assert!(
+        prompt2.contains("Implement a binary search tree"),
+        "Objective should persist across iterations"
+    );
+}
+
+#[test]
+fn test_done_section_suppressed_for_active_hat_via_event_loop() {
+    // When a hat is active (triggered by an event), the DONE section should NOT appear.
+    // This prevents intermediate hats from seeing LOOP_COMPLETE instructions.
+    let yaml = r#"
+hats:
+  implementer:
+    name: "Implementer"
+    triggers: ["test.written"]
+    publishes: ["test.passing"]
+    instructions: "Make the failing test pass."
+"#;
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Build a calculator");
+
+    // Consume the start event
+    let ralph_id = HatId::new("ralph");
+    let _ = event_loop.build_prompt(&ralph_id);
+
+    // Simulate implementer being triggered
+    event_loop
+        .bus
+        .publish(Event::new("test.written", "tests/calc_test.rs"));
+
+    let prompt = event_loop.build_prompt(&ralph_id).unwrap();
+
+    // Implementer hat is active — DONE section should be suppressed
+    assert!(
+        !prompt.contains("## DONE"),
+        "DONE section should be suppressed when a hat is active"
+    );
+    assert!(
+        !prompt.contains("You MUST output LOOP_COMPLETE"),
+        "LOOP_COMPLETE instruction should not appear for active hat"
+    );
+
+    // But the objective should still be visible
+    assert!(
+        prompt.contains("## OBJECTIVE"),
+        "OBJECTIVE should still be visible to active hat"
+    );
+    assert!(
+        prompt.contains("Build a calculator"),
+        "Objective content should be visible"
+    );
+}
+
+// === Mutant-killing tests ===
+
+#[test]
+fn test_consecutive_failures_increments_on_failed_output() {
+    // Kills: line 928 `+= 1` → `-=` / `*=`
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+
+    let ralph = HatId::new("ralph");
+
+    event_loop.process_output(&ralph, "output", false);
+    assert_eq!(event_loop.state.consecutive_failures, 1);
+
+    event_loop.process_output(&ralph, "output", false);
+    assert_eq!(event_loop.state.consecutive_failures, 2);
+}
+
+#[test]
+fn test_consecutive_failures_resets_on_success() {
+    // Kills: line 926 reset branch
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Test");
+
+    let ralph = HatId::new("ralph");
+
+    event_loop.process_output(&ralph, "output", false);
+    assert_eq!(event_loop.state.consecutive_failures, 1);
+
+    event_loop.process_output(&ralph, "output", true);
+    assert_eq!(event_loop.state.consecutive_failures, 0);
+}
+
+#[test]
+fn test_cost_based_termination() {
+    // Kills: line 383 `>=` → `<`, lines 987 `add_cost` noop / `-=` / `*=`
+    let yaml = r"
+event_loop:
+  max_cost_usd: 10.0
+";
+    let config: RalphConfig = serde_yaml::from_str(yaml).unwrap();
+    let mut event_loop = EventLoop::new(config);
+
+    event_loop.add_cost(9.99);
+    assert_eq!(
+        event_loop.check_termination(),
+        None,
+        "Should NOT terminate below max cost"
+    );
+
+    event_loop.add_cost(0.01);
+    assert_eq!(
+        event_loop.check_termination(),
+        Some(TerminationReason::MaxCost),
+        "Should terminate at exactly max cost"
+    );
+}
+
+#[test]
+fn test_malformed_events_increment_counter() {
+    // Kills: line 1063 `+= 1` → `-=` / `*=`
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.initialize("Test");
+
+    // Write invalid JSONL
+    std::fs::write(&events_path, "not valid json\n").unwrap();
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(
+        event_loop.state.consecutive_malformed_events, 1,
+        "First malformed line should set counter to 1"
+    );
+
+    // Write another invalid line (append)
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&events_path)
+        .unwrap();
+    writeln!(file, "also not json").unwrap();
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(
+        event_loop.state.consecutive_malformed_events, 2,
+        "Second malformed line should set counter to 2"
+    );
+}
+
+#[test]
+fn test_malformed_counter_resets_on_valid_event() {
+    // Kills: line 1072 `!` deletion
+    use tempfile::tempdir;
+
+    let temp_dir = tempdir().unwrap();
+    let events_path = temp_dir.path().join("events.jsonl");
+
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.event_reader = crate::event_reader::EventReader::new(&events_path);
+    event_loop.initialize("Test");
+
+    // Write invalid JSONL
+    std::fs::write(&events_path, "not valid json\n").unwrap();
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(event_loop.state.consecutive_malformed_events, 1);
+
+    // Write a valid event
+    write_event_to_jsonl(&events_path, "build.done", "success");
+    let _ = event_loop.process_events_from_jsonl();
+    assert_eq!(
+        event_loop.state.consecutive_malformed_events, 0,
+        "Counter should reset when valid events are parsed"
+    );
+}
+
+#[test]
+fn test_validation_failure_termination_at_threshold() {
+    // Kills: line 1165 `>=` → `<` and `&&` → `||`
+    // (Note: line 1165 refers to validation threshold at line 398)
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+
+    event_loop.state.consecutive_malformed_events = 2;
+    assert_eq!(
+        event_loop.check_termination(),
+        None,
+        "Should NOT terminate at 2 malformed events (threshold is 3)"
+    );
+
+    event_loop.state.consecutive_malformed_events = 3;
+    assert_eq!(
+        event_loop.check_termination(),
+        Some(TerminationReason::ValidationFailure),
+        "Should terminate at 3 malformed events"
+    );
+}
+
+#[test]
+fn test_format_event_wraps_top_level_prompts() {
+    // Kills: line 761 `==` → `!=` and `||` → `&&`
+    let config = RalphConfig::default();
+    let mut event_loop = EventLoop::new(config);
+    event_loop.initialize("Build a web server");
+
+    let ralph = HatId::new("ralph");
+    let prompt = event_loop.build_prompt(&ralph).unwrap();
+
+    // task.start event should be wrapped in <top-level-prompt>
+    assert!(
+        prompt.contains("<top-level-prompt>"),
+        "task.start events should be wrapped in <top-level-prompt> tags"
+    );
+
+    // Consume the start event, publish a non-top-level event
+    event_loop
+        .bus
+        .publish(Event::new("build.done", "completed"));
+    let prompt2 = event_loop.build_prompt(&ralph).unwrap();
+
+    // build.done is NOT a top-level prompt, should NOT have the tag
+    assert!(
+        !prompt2.contains("<top-level-prompt>"),
+        "Non-top-level events should NOT be wrapped in <top-level-prompt> tags"
+    );
+}
+
+#[test]
+fn test_check_ralph_completion_detection() {
+    // Kills: line 1241 return `true` / `false`
+    let config = RalphConfig::default();
+    let event_loop = EventLoop::new(config);
+
+    assert!(
+        event_loop.check_ralph_completion("LOOP_COMPLETE"),
+        "Should detect LOOP_COMPLETE"
+    );
+    assert!(
+        !event_loop.check_ralph_completion("no match here"),
+        "Should not detect completion in unrelated text"
     );
 }

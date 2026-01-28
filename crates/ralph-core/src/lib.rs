@@ -10,6 +10,7 @@
 //! - Terminal capture for session recording
 //! - Benchmark task definitions and workspace isolation
 
+pub mod chaos_mode;
 mod cli_capture;
 mod config;
 pub mod diagnostics;
@@ -18,18 +19,23 @@ mod event_loop;
 mod event_parser;
 mod event_reader;
 pub mod file_lock;
+mod git_ops;
+mod handoff;
 mod hat_registry;
 mod hatless_ralph;
 mod instructions;
+mod landing;
 pub mod loop_completion;
 pub mod loop_context;
 pub mod loop_history;
 pub mod loop_lock;
+mod loop_name;
 pub mod loop_registry;
 mod memory;
 pub mod memory_parser;
 mod memory_store;
 pub mod merge_queue;
+pub mod planning_session;
 mod session_player;
 mod session_recorder;
 mod summary_writer;
@@ -42,31 +48,48 @@ pub mod utils;
 pub mod workspace;
 pub mod worktree;
 
+pub use chaos_mode::{CHAOS_COMPLETION_PROMISE, ChaosModeState};
 pub use cli_capture::{CliCapture, CliCapturePair};
 pub use config::{
-    CliConfig, CoreConfig, EventLoopConfig, EventMetadata, FeaturesConfig, HatBackend, HatConfig,
-    InjectMode, MemoriesConfig, MemoriesFilter, RalphConfig,
+    ChaosModeConfig, ChaosOutput, CliConfig, CoreConfig, EventLoopConfig, EventMetadata,
+    FeaturesConfig, HatBackend, HatConfig, InjectMode, MemoriesConfig, MemoriesFilter, RalphConfig,
+    ResearchFocus,
 };
+// Re-export loop_name types (also available via FeaturesConfig.loop_naming)
 pub use diagnostics::DiagnosticsCollector;
 pub use event_logger::{EventHistory, EventLogger, EventRecord};
-pub use event_loop::{EventLoop, LoopState, TerminationReason};
+pub use event_loop::{EventLoop, LoopState, TerminationReason, UserPrompt, UserPromptError};
 pub use event_parser::EventParser;
 pub use event_reader::{Event, EventReader, MalformedLine, ParseResult};
 pub use file_lock::{FileLock, LockGuard as FileLockGuard, LockedFile};
+pub use git_ops::{
+    AutoCommitResult, GitOpsError, auto_commit_changes, clean_stashes, get_commit_summary,
+    get_current_branch, get_head_sha, get_recent_files, has_uncommitted_changes,
+    is_working_tree_clean, prune_remote_refs,
+};
+pub use handoff::{HandoffError, HandoffResult, HandoffWriter};
 pub use hat_registry::HatRegistry;
 pub use hatless_ralph::{HatInfo, HatTopology, HatlessRalph};
 pub use instructions::InstructionBuilder;
+pub use landing::{LandingConfig, LandingError, LandingHandler, LandingResult};
 pub use loop_completion::{CompletionAction, CompletionError, LoopCompletionHandler};
 pub use loop_context::LoopContext;
 pub use loop_history::{HistoryError, HistoryEvent, HistoryEventType, HistorySummary, LoopHistory};
 pub use loop_lock::{LockError, LockGuard, LockMetadata, LoopLock};
+pub use loop_name::{LoopNameGenerator, LoopNamingConfig};
 pub use loop_registry::{LoopEntry, LoopRegistry, RegistryError};
 pub use memory::{Memory, MemoryType};
 pub use memory_store::{
     DEFAULT_MEMORIES_PATH, MarkdownMemoryStore, format_memories_as_markdown, truncate_to_budget,
 };
 pub use merge_queue::{
-    MergeEntry, MergeEvent, MergeEventType, MergeQueue, MergeQueueError, MergeState,
+    MergeButtonState, MergeEntry, MergeEvent, MergeEventType, MergeOption, MergeQueue,
+    MergeQueueError, MergeState, SteeringDecision, merge_button_state, merge_execution_summary,
+    merge_needs_steering, smart_merge_summary,
+};
+pub use planning_session::{
+    ConversationEntry, ConversationType, PlanningSession, PlanningSessionError, SessionMetadata,
+    SessionStatus,
 };
 pub use session_player::{PlayerConfig, ReplayMode, SessionPlayer, TimestampedRecord};
 pub use session_recorder::{Record, SessionRecorder};
@@ -82,6 +105,7 @@ pub use workspace::{
     WorkspaceManager,
 };
 pub use worktree::{
-    Worktree, WorktreeConfig, WorktreeError, create_worktree, ensure_gitignore,
-    list_ralph_worktrees, list_worktrees, remove_worktree, worktree_exists,
+    SyncStats, Worktree, WorktreeConfig, WorktreeError, create_worktree, ensure_gitignore,
+    list_ralph_worktrees, list_worktrees, remove_worktree, sync_working_directory_to_worktree,
+    worktree_exists,
 };

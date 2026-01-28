@@ -60,17 +60,24 @@ impl CliBackend {
     /// # Errors
     /// Returns `CustomBackendError` if backend is "custom" but no command is specified.
     pub fn from_config(config: &CliConfig) -> Result<Self, CustomBackendError> {
-        match config.backend.as_str() {
-            "claude" => Ok(Self::claude()),
-            "kiro" => Ok(Self::kiro()),
-            "gemini" => Ok(Self::gemini()),
-            "codex" => Ok(Self::codex()),
-            "amp" => Ok(Self::amp()),
-            "copilot" => Ok(Self::copilot()),
-            "opencode" => Ok(Self::opencode()),
-            "custom" => Self::custom(config),
-            _ => Ok(Self::claude()), // Default to claude
+        let mut backend = match config.backend.as_str() {
+            "claude" => Self::claude(),
+            "kiro" => Self::kiro(),
+            "gemini" => Self::gemini(),
+            "codex" => Self::codex(),
+            "amp" => Self::amp(),
+            "copilot" => Self::copilot(),
+            "opencode" => Self::opencode(),
+            "custom" => return Self::custom(config),
+            _ => Self::claude(), // Default to claude
+        };
+
+        // Honor command override for named backends (e.g., custom binary path)
+        if let Some(ref cmd) = config.command {
+            backend.command = cmd.clone();
         }
+
+        Ok(backend)
     }
 
     /// Creates the Claude backend.
@@ -89,6 +96,8 @@ impl CliBackend {
                 "--verbose".to_string(),
                 "--output-format".to_string(),
                 "stream-json".to_string(),
+                "--disallowedTools".to_string(),
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet".to_string(),
             ],
             prompt_mode: PromptMode::Arg,
             prompt_flag: Some("-p".to_string()),
@@ -106,7 +115,11 @@ impl CliBackend {
     pub fn claude_interactive() -> Self {
         Self {
             command: "claude".to_string(),
-            args: vec!["--dangerously-skip-permissions".to_string()],
+            args: vec![
+                "--dangerously-skip-permissions".to_string(),
+                "--disallowedTools".to_string(),
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet".to_string(),
+            ],
             prompt_mode: PromptMode::Arg,
             prompt_flag: None,
             output_format: OutputFormat::Text,
@@ -550,6 +563,8 @@ mod tests {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "--disallowedTools",
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet",
                 "-p",
                 "test prompt"
             ]
@@ -564,9 +579,17 @@ mod tests {
         let (cmd, args, stdin, _temp) = backend.build_command("test prompt", false);
 
         assert_eq!(cmd, "claude");
-        // Should have --dangerously-skip-permissions and prompt as positional arg
+        // Should have --dangerously-skip-permissions, --disallowedTools, and prompt as positional arg
         // No -p flag, no --output-format, no --verbose
-        assert_eq!(args, vec!["--dangerously-skip-permissions", "test prompt"]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--disallowedTools",
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet",
+                "test prompt"
+            ]
+        );
         assert!(stdin.is_none()); // Uses positional arg, not stdin
         assert_eq!(backend.output_format, OutputFormat::Text);
         assert_eq!(backend.prompt_flag, None);
@@ -687,6 +710,21 @@ mod tests {
     }
 
     #[test]
+    fn test_from_config_command_override() {
+        let config = CliConfig {
+            backend: "claude".to_string(),
+            command: Some("my-custom-claude".to_string()),
+            prompt_mode: "arg".to_string(),
+            ..Default::default()
+        };
+        let backend = CliBackend::from_config(&config).unwrap();
+
+        assert_eq!(backend.command, "my-custom-claude");
+        assert_eq!(backend.prompt_flag, Some("-p".to_string()));
+        assert_eq!(backend.output_format, OutputFormat::StreamJson);
+    }
+
+    #[test]
     fn test_kiro_interactive_mode_omits_no_interactive_flag() {
         let backend = CliBackend::kiro();
         let (cmd, args, stdin, _temp) = backend.build_command("test prompt", true);
@@ -746,6 +784,8 @@ mod tests {
                 "--verbose",
                 "--output-format",
                 "stream-json",
+                "--disallowedTools",
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet",
                 "-p",
                 "test prompt"
             ]
@@ -995,7 +1035,15 @@ mod tests {
 
         assert_eq!(cmd, "claude");
         // Should use positional arg (no -p flag)
-        assert_eq!(args, vec!["--dangerously-skip-permissions", "test prompt"]);
+        assert_eq!(
+            args,
+            vec![
+                "--dangerously-skip-permissions",
+                "--disallowedTools",
+                "TodoWrite,TaskCreate,TaskUpdate,TaskList,TaskGet",
+                "test prompt"
+            ]
+        );
         assert!(stdin.is_none());
         assert_eq!(backend.prompt_flag, None);
     }

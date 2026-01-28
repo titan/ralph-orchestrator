@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 use ralph_core::worktree::{list_ralph_worktrees, remove_worktree};
-use ralph_core::{LoopRegistry, MergeQueue, MergeState};
+use ralph_core::{LoopRegistry, MergeButtonState, MergeQueue, MergeState, merge_button_state};
 
 /// Manage parallel loops.
 #[derive(Parser, Debug)]
@@ -32,7 +32,7 @@ pub struct LoopsArgs {
 #[derive(Subcommand, Debug)]
 pub enum LoopsCommands {
     /// List all loops (default if no subcommand)
-    List,
+    List(ListArgs),
 
     /// View loop output/logs
     Logs(LogsArgs),
@@ -60,6 +60,23 @@ pub enum LoopsCommands {
 
     /// Merge a completed loop (or force retry)
     Merge(MergeArgs),
+
+    /// Process pending merge queue entries
+    Process,
+
+    /// Get merge button state for a loop (JSON output for web API)
+    MergeButtonState(MergeButtonStateArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct ListArgs {
+    /// Output JSON instead of table
+    #[arg(long)]
+    pub json: bool,
+
+    /// Show all loops including terminal states (merged, discarded)
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -134,10 +151,23 @@ pub struct MergeArgs {
     pub force: bool,
 }
 
+#[derive(Parser, Debug)]
+pub struct MergeButtonStateArgs {
+    /// Loop ID
+    pub loop_id: String,
+}
+
 /// Execute a loops command.
 pub fn execute(args: LoopsArgs, use_colors: bool) -> Result<()> {
     match args.command {
-        None | Some(LoopsCommands::List) => list_loops(use_colors),
+        None => list_loops(
+            ListArgs {
+                json: false,
+                all: false,
+            },
+            use_colors,
+        ),
+        Some(LoopsCommands::List(args)) => list_loops(args, use_colors),
         Some(LoopsCommands::Logs(logs_args)) => show_logs(logs_args),
         Some(LoopsCommands::History(history_args)) => show_history(history_args),
         Some(LoopsCommands::Retry(retry_args)) => retry_merge(retry_args),
@@ -147,7 +177,35 @@ pub fn execute(args: LoopsArgs, use_colors: bool) -> Result<()> {
         Some(LoopsCommands::Attach(attach_args)) => attach_to_loop(attach_args),
         Some(LoopsCommands::Diff(diff_args)) => show_diff(diff_args),
         Some(LoopsCommands::Merge(merge_args)) => merge_loop(merge_args),
+        Some(LoopsCommands::Process) => process_queue(),
+        Some(LoopsCommands::MergeButtonState(args)) => get_merge_button_state(args),
     }
+}
+
+/// Process pending merge queue entries.
+fn process_queue() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+
+    // Delegate to the loop_runner's process_pending_merges function
+    crate::loop_runner::process_pending_merges_cli(&cwd);
+
+    Ok(())
+}
+
+/// Get merge button state for a loop (JSON output for web API).
+fn get_merge_button_state(args: MergeButtonStateArgs) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let state = merge_button_state(&cwd, &args.loop_id)?;
+
+    let json = match state {
+        MergeButtonState::Active => serde_json::json!({ "state": "active" }),
+        MergeButtonState::Blocked { reason } => {
+            serde_json::json!({ "state": "blocked", "reason": reason })
+        }
+    };
+
+    println!("{}", serde_json::to_string(&json)?);
+    Ok(())
 }
 
 /// Check if a process is alive.
@@ -168,13 +226,28 @@ fn is_process_alive(pid: u32) -> bool {
     }
 }
 
+/// Format duration as relative age (e.g., "5m", "2h", "1d").
+fn format_age(duration: chrono::Duration) -> String {
+    let secs = duration.num_seconds();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h", secs / 3600)
+    } else {
+        format!("{}d", secs / 86400)
+    }
+}
+
 /// List all loops with their status.
-fn list_loops(use_colors: bool) -> Result<()> {
+fn list_loops(args: ListArgs, use_colors: bool) -> Result<()> {
     use ralph_core::LoopLock;
 
     let cwd = std::env::current_dir()?;
     let registry = LoopRegistry::new(&cwd);
     let merge_queue = MergeQueue::new(&cwd);
+    let now = chrono::Utc::now();
 
     // Get loops from registry
     let loop_entries = registry.list().unwrap_or_default();
@@ -187,6 +260,8 @@ fn list_loops(use_colors: bool) -> Result<()> {
 
     // Build combined view
     let mut rows: Vec<LoopRow> = Vec::new();
+    let mut has_needs_review = false;
+    let mut hidden_terminal_count = 0;
 
     // Check for primary loop holding the lock (not in a worktree)
     if let Ok(true) = LoopLock::is_locked(&cwd) {
@@ -205,6 +280,8 @@ fn list_loops(use_colors: bool) -> Result<()> {
                     status: "running".to_string(),
                     location: "(in-place)".to_string(),
                     prompt: truncate(&metadata.prompt, 40),
+                    age: None,   // Primary loop age not easily available
+                    merge: None, // Primary loop doesn't have merge state
                 });
             }
         }
@@ -229,6 +306,8 @@ fn list_loops(use_colors: bool) -> Result<()> {
             status: status.to_string(),
             location,
             prompt: truncate(&entry.prompt, 40),
+            age: None, // Registry doesn't track start time
+            merge: None,
         });
     }
 
@@ -236,19 +315,51 @@ fn list_loops(use_colors: bool) -> Result<()> {
     for entry in &merge_entries {
         let already_listed = rows.iter().any(|r| r.id.ends_with(&entry.loop_id));
         if !already_listed {
+            // Skip terminal merge states unless --all is specified
+            if entry.state.is_terminal() && !args.all {
+                hidden_terminal_count += 1;
+                continue;
+            }
+
             let status = match entry.state {
                 MergeState::Queued => "queued",
                 MergeState::Merging => "merging",
                 MergeState::Merged => "merged",
-                MergeState::NeedsReview => "needs-review",
+                MergeState::NeedsReview => {
+                    has_needs_review = true;
+                    "needs-review"
+                }
                 MergeState::Discarded => "discarded",
+            };
+
+            // Calculate age from entry timestamp
+            let age = Some(format_age(now.signed_duration_since(entry.queued_at)));
+
+            // For merged entries, show commit SHA in location column
+            let location = if let Some(ref sha) = entry.merge_commit {
+                sha.clone()
+            } else {
+                "-".to_string()
+            };
+
+            // Get merge button state for queued entries
+            let merge_status = if entry.state == MergeState::Queued {
+                match merge_button_state(&cwd, &entry.loop_id) {
+                    Ok(MergeButtonState::Active) => Some("ready".to_string()),
+                    Ok(MergeButtonState::Blocked { .. }) => Some("blocked".to_string()),
+                    Err(_) => None,
+                }
+            } else {
+                None
             };
 
             rows.push(LoopRow {
                 id: entry.loop_id.clone(),
                 status: status.to_string(),
-                location: "-".to_string(),
+                location,
                 prompt: truncate(&entry.prompt, 40),
+                age,
+                merge: merge_status,
             });
         }
     }
@@ -264,19 +375,65 @@ fn list_loops(use_colors: bool) -> Result<()> {
                     status: "orphan".to_string(),
                     location: shorten_path(&wt.path.to_string_lossy()),
                     prompt: String::new(),
+                    age: None,
+                    merge: None,
                 });
             }
         }
     }
 
     if rows.is_empty() {
-        println!("No loops found.");
+        if args.json {
+            println!("[]");
+        } else {
+            println!("No loops found.");
+        }
         return Ok(());
     }
 
+    if args.json {
+        let json = serde_json::to_string_pretty(&rows)?;
+        println!("{json}");
+        return Ok(());
+    }
+
+    // Count by status for summary header
+    let mut status_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for row in &rows {
+        *status_counts.entry(&row.status).or_insert(0) += 1;
+    }
+
+    // Print summary header
+    let summary_parts: Vec<String> = [
+        "running",
+        "queued",
+        "merging",
+        "needs-review",
+        "merged",
+        "discarded",
+        "crashed",
+        "orphan",
+    ]
+    .iter()
+    .filter_map(|s| {
+        status_counts
+            .get(s)
+            .map(|count| format!("{}: {}", s, count))
+    })
+    .collect();
+
+    if !summary_parts.is_empty() {
+        println!("Loops: {}", summary_parts.join(", "));
+        println!();
+    }
+
     // Print table
-    println!("{:<20} {:<12} {:<25} PROMPT", "ID", "STATUS", "LOCATION");
-    println!("{}", "-".repeat(80));
+    println!(
+        "{:<20} {:<12} {:<8} {:<8} {:<20} PROMPT",
+        "ID", "STATUS", "MERGE", "AGE", "LOCATION"
+    );
+    println!("{}", "-".repeat(88));
 
     for row in rows {
         let status_display = if use_colors {
@@ -285,23 +442,46 @@ fn list_loops(use_colors: bool) -> Result<()> {
             row.status.clone()
         };
 
+        let age_display = row.age.as_deref().unwrap_or("-");
+        let merge_display = row.merge.as_deref().unwrap_or("-");
+
         println!(
-            "{:<20} {:<12} {:<25} {}",
+            "{:<20} {:<12} {:<8} {:<8} {:<20} {}",
             truncate(&row.id, 20),
             status_display,
-            truncate(&row.location, 25),
+            merge_display,
+            age_display,
+            truncate(&row.location, 20),
             row.prompt
         );
     }
 
+    // Print footer hints
+    println!();
+    if hidden_terminal_count > 0 {
+        println!(
+            "({} merged/discarded hidden. Use --all to show.)",
+            hidden_terminal_count
+        );
+    }
+    if has_needs_review {
+        println!("Hint: Use `ralph loops retry <id>` to retry failed merges.");
+    }
+    println!("Use `ralph loops --help` for more commands.");
+
     Ok(())
 }
 
+#[derive(serde::Serialize)]
 struct LoopRow {
     id: String,
     status: String,
     location: String,
     prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    age: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    merge: Option<String>,
 }
 
 fn colorize_status(status: &str) -> String {
@@ -778,6 +958,7 @@ fn spawn_merge_ralph(cwd: &std::path::Path, loop_id: &str) -> Result<()> {
             "run",
             "-c",
             ".ralph/merge-loop-config.yml",
+            "--exclusive",
             "-p",
             &format!("Merge loop {} from branch ralph/{}", loop_id, loop_id),
         ])

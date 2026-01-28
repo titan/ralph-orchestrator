@@ -156,10 +156,20 @@ impl EventLogger {
 
     /// Creates a logger using the events path from a LoopContext.
     ///
-    /// This ensures the logger writes to the correct location when running
-    /// in a worktree or other isolated workspace.
+    /// This reads the timestamped events path from the marker file if it exists,
+    /// falling back to the default events path. This ensures the logger writes
+    /// to the correct location when running in a worktree or other isolated workspace.
     pub fn from_context(context: &LoopContext) -> Self {
-        Self::new(context.events_path())
+        // Read timestamped events path from marker file, fall back to default
+        // The marker file contains a relative path like ".ralph/events-20260127-123456.jsonl"
+        // which we resolve relative to the workspace root
+        let events_path = std::fs::read_to_string(context.current_events_marker())
+            .map(|s| {
+                let relative = s.trim();
+                context.workspace().join(relative)
+            })
+            .unwrap_or_else(|_| context.events_path());
+        Self::new(events_path)
     }
 
     /// Ensures the parent directory exists and opens the file.
@@ -178,10 +188,16 @@ impl EventLogger {
     }
 
     /// Logs an event record.
+    ///
+    /// Uses a single `write_all` call to ensure the JSON line is written atomically.
+    /// This prevents corruption when multiple processes append to the same file
+    /// concurrently (e.g., during parallel merge queue processing).
     pub fn log(&mut self, record: &EventRecord) -> std::io::Result<()> {
         let file = self.ensure_open()?;
-        let json = serde_json::to_string(record)?;
-        writeln!(file, "{}", json)?;
+        let mut json = serde_json::to_string(record)?;
+        json.push('\n');
+        // Single write_all ensures atomic append on POSIX with O_APPEND
+        file.write_all(json.as_bytes())?;
         file.flush()?;
         debug!(topic = %record.topic, iteration = record.iteration, "Event logged");
         Ok(())

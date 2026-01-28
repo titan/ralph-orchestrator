@@ -1,10 +1,11 @@
 //! Summary file generation for loop termination.
 //!
-//! Per spec: "On termination, the orchestrator writes `.agent/summary.md`"
+//! Per spec: "On termination, the orchestrator writes `.ralph/agent/summary.md`"
 //! with status, iterations, duration, task list, events summary, and commit info.
 
 use crate::event_logger::EventHistory;
 use crate::event_loop::{LoopState, TerminationReason};
+use crate::landing::LandingResult;
 use crate::loop_context::LoopContext;
 use std::collections::HashMap;
 use std::fs;
@@ -46,7 +47,7 @@ pub struct SummaryWriter {
 
 impl Default for SummaryWriter {
     fn default() -> Self {
-        Self::new(".agent/summary.md")
+        Self::new(".ralph/agent/summary.md")
     }
 }
 
@@ -81,22 +82,43 @@ impl SummaryWriter {
         scratchpad_path: Option<&Path>,
         final_commit: Option<&str>,
     ) -> io::Result<()> {
-        // Ensure parent directory exists
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let content = self.generate_content(reason, state, scratchpad_path, final_commit);
-        fs::write(&self.path, content)
+        self.write_with_landing(reason, state, scratchpad_path, final_commit, None)
     }
 
-    /// Generates the markdown content for the summary.
-    fn generate_content(
+    /// Writes the summary file with optional landing information.
+    ///
+    /// This is called by the orchestrator when the loop terminates with landing.
+    pub fn write_with_landing(
         &self,
         reason: &TerminationReason,
         state: &LoopState,
         scratchpad_path: Option<&Path>,
         final_commit: Option<&str>,
+        landing: Option<&LandingResult>,
+    ) -> io::Result<()> {
+        // Ensure parent directory exists
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let content = self.generate_content_with_landing(
+            reason,
+            state,
+            scratchpad_path,
+            final_commit,
+            landing,
+        );
+        fs::write(&self.path, content)
+    }
+
+    /// Generates the markdown content for the summary with optional landing info.
+    fn generate_content_with_landing(
+        &self,
+        reason: &TerminationReason,
+        state: &LoopState,
+        scratchpad_path: Option<&Path>,
+        final_commit: Option<&str>,
+        landing: Option<&LandingResult>,
     ) -> String {
         let mut content = String::new();
 
@@ -139,6 +161,49 @@ impl SummaryWriter {
             content.push('\n');
         }
 
+        // Landing section (if landing was performed)
+        if let Some(landing_result) = landing {
+            content.push('\n');
+            content.push_str("## Landing\n\n");
+
+            if landing_result.committed {
+                content.push_str(&format!(
+                    "- **Auto-committed:** Yes ({})\n",
+                    landing_result.commit_sha.as_deref().unwrap_or("unknown")
+                ));
+            } else {
+                content.push_str("- **Auto-committed:** No (working tree was clean)\n");
+            }
+
+            content.push_str(&format!(
+                "- **Handoff:** `{}`\n",
+                landing_result.handoff_path.display()
+            ));
+
+            if !landing_result.open_tasks.is_empty() {
+                content.push_str(&format!(
+                    "- **Open tasks:** {}\n",
+                    landing_result.open_tasks.len()
+                ));
+            }
+
+            if landing_result.stashes_cleared > 0 {
+                content.push_str(&format!(
+                    "- **Stashes cleared:** {}\n",
+                    landing_result.stashes_cleared
+                ));
+            }
+
+            content.push_str(&format!(
+                "- **Working tree clean:** {}\n",
+                if landing_result.working_tree_clean {
+                    "Yes"
+                } else {
+                    "No"
+                }
+            ));
+        }
+
         content
     }
 
@@ -154,6 +219,8 @@ impl SummaryWriter {
             TerminationReason::ValidationFailure => "Failed: too many malformed JSONL events",
             TerminationReason::Stopped => "Stopped manually",
             TerminationReason::Interrupted => "Interrupted by signal",
+            TerminationReason::ChaosModeComplete => "Chaos mode: exploration complete",
+            TerminationReason::ChaosModeMaxIterations => "Chaos mode: max iterations reached",
         }
     }
 
@@ -248,7 +315,6 @@ mod tests {
             task_block_counts: std::collections::HashMap::new(),
             abandoned_tasks: Vec::new(),
             abandoned_task_redispatches: 0,
-            completion_confirmations: 0,
             consecutive_malformed_events: 0,
             hat_activation_counts: std::collections::HashMap::new(),
             exhausted_hats: std::collections::HashSet::new(),
@@ -316,11 +382,12 @@ More text here.
         let writer = SummaryWriter::default();
         let state = test_state();
 
-        let content = writer.generate_content(
+        let content = writer.generate_content_with_landing(
             &TerminationReason::CompletionPromise,
             &state,
             None,
             Some("abc1234: feat(auth): add tokens"),
+            None,
         );
 
         assert!(content.contains("# Loop Summary"));
@@ -348,5 +415,41 @@ More text here.
         assert!(path.exists());
         let content = fs::read_to_string(path).unwrap();
         assert!(content.contains("# Loop Summary"));
+    }
+
+    #[test]
+    fn test_write_with_landing() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("summary.md");
+
+        let writer = SummaryWriter::new(&path);
+        let state = test_state();
+
+        let landing = LandingResult {
+            committed: true,
+            commit_sha: Some("abc1234".to_string()),
+            handoff_path: tmp.path().join("handoff.md"),
+            open_tasks: vec!["task-1".to_string(), "task-2".to_string()],
+            stashes_cleared: 2,
+            working_tree_clean: true,
+        };
+
+        writer
+            .write_with_landing(
+                &TerminationReason::CompletionPromise,
+                &state,
+                None,
+                None,
+                Some(&landing),
+            )
+            .unwrap();
+
+        let content = fs::read_to_string(path).unwrap();
+        assert!(content.contains("## Landing"));
+        assert!(content.contains("**Auto-committed:** Yes (abc1234)"));
+        assert!(content.contains("**Handoff:**"));
+        assert!(content.contains("**Open tasks:** 2"));
+        assert!(content.contains("**Stashes cleared:** 2"));
+        assert!(content.contains("**Working tree clean:** Yes"));
     }
 }

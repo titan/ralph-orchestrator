@@ -93,6 +93,26 @@ impl LoopEntry {
         }
     }
 
+    /// Creates a new loop entry with a specific ID.
+    ///
+    /// Use this when you need the loop ID to match other identifiers
+    /// (e.g., worktree name, branch name).
+    pub fn with_id(
+        id: impl Into<String>,
+        prompt: impl Into<String>,
+        worktree_path: Option<impl Into<String>>,
+        workspace: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            pid: process::id(),
+            started: Utc::now(),
+            prompt: prompt.into(),
+            worktree_path: worktree_path.map(Into::into),
+            workspace: workspace.into(),
+        }
+    }
+
     /// Generates a unique loop ID: loop-{timestamp}-{hex_suffix}
     fn generate_id() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -107,11 +127,11 @@ impl LoopEntry {
     /// Checks if the process for this loop is still running.
     #[cfg(unix)]
     pub fn is_alive(&self) -> bool {
-        use nix::sys::signal::{Signal, kill};
+        use nix::sys::signal::kill;
         use nix::unistd::Pid;
 
-        // Signal 0 checks if process exists without sending a signal
-        kill(Pid::from_raw(self.pid as i32), Signal::SIGCONT)
+        // Signal 0 (None) checks if process exists without sending a signal
+        kill(Pid::from_raw(self.pid as i32), None)
             .map(|_| true)
             .unwrap_or(false)
     }
@@ -222,6 +242,21 @@ impl LoopRegistry {
             removed = original_len - data.loops.len();
         })?;
         Ok(removed)
+    }
+
+    /// Deregisters all entries for the current process.
+    ///
+    /// This is useful for cleanup on termination, since each process
+    /// can only have one active loop entry.
+    pub fn deregister_current_process(&self) -> Result<bool, RegistryError> {
+        let pid = std::process::id();
+        let mut found = false;
+        self.with_lock(|data| {
+            let original_len = data.loops.len();
+            data.loops.retain(|e| e.pid != pid);
+            found = data.loops.len() != original_len;
+        })?;
+        Ok(found)
     }
 
     /// Executes an operation with the registry file locked.
@@ -361,6 +396,21 @@ mod tests {
         let entry = LoopEntry::new("test", None::<String>);
         // Current process should be alive
         assert!(entry.is_alive());
+    }
+
+    #[test]
+    fn test_loop_entry_with_id() {
+        let entry = LoopEntry::with_id(
+            "bright-maple",
+            "test prompt",
+            Some("/path/to/worktree"),
+            "/workspace",
+        );
+        assert_eq!(entry.id, "bright-maple");
+        assert_eq!(entry.pid, process::id());
+        assert_eq!(entry.prompt, "test prompt");
+        assert_eq!(entry.worktree_path, Some("/path/to/worktree".to_string()));
+        assert_eq!(entry.workspace, "/workspace");
     }
 
     #[test]
@@ -576,5 +626,25 @@ mod tests {
 
         let deserialized: LoopEntry = serde_json::from_str(&json).unwrap();
         assert!(deserialized.worktree_path.is_none());
+    }
+
+    #[test]
+    fn test_deregister_current_process() {
+        let temp_dir = TempDir::new().unwrap();
+        let registry = LoopRegistry::new(temp_dir.path());
+
+        // Register an entry (uses current PID)
+        let entry = LoopEntry::new("test prompt", None::<String>);
+        registry.register(entry).unwrap();
+        assert_eq!(registry.list().unwrap().len(), 1);
+
+        // Deregister by current process
+        let found = registry.deregister_current_process().unwrap();
+        assert!(found);
+        assert_eq!(registry.list().unwrap().len(), 0);
+
+        // Second deregister should return false (nothing to remove)
+        let found = registry.deregister_current_process().unwrap();
+        assert!(!found);
     }
 }

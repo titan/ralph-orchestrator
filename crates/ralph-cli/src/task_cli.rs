@@ -51,6 +51,9 @@ pub enum TaskCommands {
     /// Mark a task as complete
     Close(CloseArgs),
 
+    /// Mark a task as failed
+    Fail(FailArgs),
+
     /// Show a single task by ID
     Show(ShowArgs),
 }
@@ -81,7 +84,7 @@ pub struct AddArgs {
 /// Arguments for the `task list` command.
 #[derive(Parser, Debug)]
 pub struct ListArgs {
-    /// Filter by status: open, in_progress, closed
+    /// Filter by status: open, in_progress, closed, failed
     #[arg(short = 's', long)]
     pub status: Option<String>,
 
@@ -93,6 +96,10 @@ pub struct ListArgs {
     #[arg(long, short = 'l')]
     pub limit: Option<usize>,
 
+    /// Show all tasks including closed and failed (hidden by default)
+    #[arg(long, short = 'a')]
+    pub all: bool,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -101,6 +108,10 @@ pub struct ListArgs {
 /// Arguments for the `task ready` command.
 #[derive(Parser, Debug)]
 pub struct ReadyArgs {
+    /// Show tasks from all loops, not just the current one
+    #[arg(long, short = 'a')]
+    pub all: bool,
+
     /// Output format
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
@@ -110,6 +121,13 @@ pub struct ReadyArgs {
 #[derive(Parser, Debug)]
 pub struct CloseArgs {
     /// Task ID to close
+    pub id: String,
+}
+
+/// Arguments for the `task fail` command.
+#[derive(Parser, Debug)]
+pub struct FailArgs {
+    /// Task ID to mark as failed
     pub id: String,
 }
 
@@ -127,7 +145,7 @@ pub struct ShowArgs {
 /// Gets the tasks file path.
 fn get_tasks_path(root: Option<&PathBuf>) -> PathBuf {
     let base = root.map(|p| p.as_path()).unwrap_or(Path::new("."));
-    base.join(".agent").join("tasks.jsonl")
+    base.join(".ralph").join("agent").join("tasks.jsonl")
 }
 
 /// Executes task CLI commands.
@@ -139,6 +157,7 @@ pub fn execute(args: TaskArgs, use_colors: bool) -> Result<()> {
         TaskCommands::List(list_args) => execute_list(list_args, root.as_ref(), use_colors),
         TaskCommands::Ready(ready_args) => execute_ready(ready_args, root.as_ref(), use_colors),
         TaskCommands::Close(close_args) => execute_close(close_args, root.as_ref(), use_colors),
+        TaskCommands::Fail(fail_args) => execute_fail(fail_args, root.as_ref(), use_colors),
         TaskCommands::Show(show_args) => execute_show(show_args, root.as_ref(), use_colors),
     }
 }
@@ -148,6 +167,20 @@ fn execute_add(args: AddArgs, root: Option<&PathBuf>, use_colors: bool) -> Resul
     let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
 
     let mut task = Task::new(args.title, args.priority);
+
+    // Auto-tag with loop ID from marker file if available
+    let loop_id_marker = get_tasks_path(root)
+        .parent()
+        .and_then(|p| p.parent()) // .ralph/agent -> .ralph
+        .map(|p| p.join("current-loop-id"));
+    if let Some(marker_path) = loop_id_marker
+        && let Ok(loop_id) = std::fs::read_to_string(&marker_path)
+    {
+        let loop_id = loop_id.trim().to_string();
+        if !loop_id.is_empty() {
+            task = task.with_loop_id(Some(loop_id));
+        }
+    }
 
     if let Some(desc) = args.description {
         task = task.with_description(Some(desc));
@@ -192,14 +225,24 @@ fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
     let store = TaskStore::load(&path).context("Failed to load tasks")?;
 
     let mut tasks: Vec<_> = if let Some(status_str) = args.status {
+        // When filtering by specific status, show all matching tasks
         store
             .all()
             .iter()
             .filter(|t| format!("{:?}", t.status).to_lowercase() == status_str.to_lowercase())
             .cloned()
             .collect()
-    } else {
+    } else if args.all {
+        // Show all tasks including closed and failed
         store.all().to_vec()
+    } else {
+        // Default: hide closed and failed tasks
+        store
+            .all()
+            .iter()
+            .filter(|t| !matches!(t.status, TaskStatus::Closed | TaskStatus::Failed))
+            .cloned()
+            .collect()
     };
 
     // Filter by days
@@ -227,7 +270,7 @@ fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
     }
 
     // Sort tasks:
-    // 1. Status: InProgress > Open > Closed
+    // 1. Status: InProgress > Open > Closed > Failed
     // 2. Priority: 1 (High) > 5 (Low)
     // 3. Created: Oldest first
     tasks.sort_by(|a, b| {
@@ -235,6 +278,7 @@ fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
             TaskStatus::InProgress => 0,
             TaskStatus::Open => 1,
             TaskStatus::Closed => 2,
+            TaskStatus::Failed => 3,
         };
 
         let rank_a = status_rank(a.status);
@@ -285,6 +329,7 @@ fn execute_list(args: ListArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
                         TaskStatus::Open => ("open", colors::GREEN),
                         TaskStatus::InProgress => ("in_progress", colors::BLUE),
                         TaskStatus::Closed => ("closed", colors::DIM),
+                        TaskStatus::Failed => ("failed", colors::RED),
                     };
 
                     let priority_color = match task.priority {
@@ -339,7 +384,25 @@ fn execute_ready(args: ReadyArgs, root: Option<&PathBuf>, use_colors: bool) -> R
     let path = get_tasks_path(root);
     let store = TaskStore::load(&path).context("Failed to load tasks")?;
 
-    let ready = store.ready();
+    let mut ready = store.ready();
+
+    // Filter by current loop ID unless --all is specified
+    if !args.all {
+        // Read loop ID from marker file
+        let loop_id_marker = get_tasks_path(root)
+            .parent()
+            .and_then(|p| p.parent()) // .ralph/agent -> .ralph
+            .map(|p| p.join("current-loop-id"));
+        if let Some(marker_path) = loop_id_marker
+            && let Ok(current_loop_id) = std::fs::read_to_string(&marker_path)
+        {
+            let current_loop_id = current_loop_id.trim().to_string();
+            if !current_loop_id.is_empty() {
+                ready.retain(|t| t.loop_id.as_ref() == Some(&current_loop_id));
+            }
+        }
+        // If marker file doesn't exist, show all tasks (backward compatibility)
+    }
 
     match args.format {
         OutputFormat::Table => {
@@ -435,6 +498,34 @@ fn execute_close(args: CloseArgs, root: Option<&PathBuf>, use_colors: bool) -> R
     Ok(())
 }
 
+fn execute_fail(args: FailArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
+    let path = get_tasks_path(root);
+    let mut store = TaskStore::load(&path).context("Failed to load tasks")?;
+
+    let task_id = args.id.clone();
+    let title = store
+        .fail(&task_id)
+        .context(format!("Task {} not found", task_id))?
+        .title
+        .clone();
+
+    store.save().context("Failed to save tasks")?;
+
+    if use_colors {
+        println!(
+            "{}Failed task: {} - {}{}",
+            colors::RED,
+            task_id,
+            title,
+            colors::RESET
+        );
+    } else {
+        println!("Failed task: {} - {}", task_id, title);
+    }
+
+    Ok(())
+}
+
 fn execute_show(args: ShowArgs, root: Option<&PathBuf>, use_colors: bool) -> Result<()> {
     let path = get_tasks_path(root);
     let store = TaskStore::load(&path).context("Failed to load tasks")?;
@@ -449,6 +540,7 @@ fn execute_show(args: ShowArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
                 TaskStatus::Open => "open",
                 TaskStatus::InProgress => "in_progress",
                 TaskStatus::Closed => "closed",
+                TaskStatus::Failed => "failed",
             };
 
             if use_colors {
@@ -456,6 +548,7 @@ fn execute_show(args: ShowArgs, root: Option<&PathBuf>, use_colors: bool) -> Res
                     TaskStatus::Open => colors::GREEN,
                     TaskStatus::InProgress => colors::BLUE,
                     TaskStatus::Closed => colors::DIM,
+                    TaskStatus::Failed => colors::RED,
                 };
                 let priority_color = match task.priority {
                     1 => colors::RED,
