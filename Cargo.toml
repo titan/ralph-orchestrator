@@ -118,6 +118,9 @@ colored = "3"
 # Progress indicators
 indicatif = "0.17"
 
+# Open URLs in default browser
+open = "5"
+
 # PTY support
 portable-pty = "0.9"
 nix = { version = "0.29", features = ["signal", "term", "fs"] }

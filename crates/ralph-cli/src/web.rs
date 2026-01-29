@@ -1,9 +1,5 @@
-//! # ralph web
-//!
-//! Web dashboard development server launcher.
-//!
-//! This module provides the `ralph web` command that runs both the backend
-//! and frontend dev servers in parallel.
+// ABOUTME: Web dashboard development server launcher.
+// ABOUTME: Provides the `ralph web` command that runs backend and frontend dev servers in parallel.
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -12,7 +8,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command as AsyncCommand};
+use tokio::sync::Notify;
 
 #[cfg(unix)]
 use nix::sys::signal::{Signal, kill};
@@ -21,6 +19,9 @@ use nix::unistd::Pid;
 
 /// Grace period for servers to shut down before SIGKILL (matches backend's SIGINT handler)
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Timeout for both servers to become ready
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Arguments for the web subcommand
 #[derive(Parser, Debug)]
@@ -36,6 +37,10 @@ pub struct WebArgs {
     /// Workspace root directory (default: current directory)
     #[arg(long)]
     pub workspace: Option<PathBuf>,
+
+    /// Don't open the dashboard in the default browser
+    #[arg(long)]
+    pub no_open: bool,
 }
 
 /// Check that Node.js is installed and >= 18. Returns the version string.
@@ -135,8 +140,44 @@ async fn run_npm_install(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Run pre-flight checks: verify Node.js/npm and auto-install dependencies.
-async fn preflight(root: &Path) -> Result<()> {
+/// Check that a TCP port is available for binding.
+fn check_port_available(port: u16) -> Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            anyhow::bail!(
+                "Port {} is already in use.\n\
+                 Use --backend-port or --frontend-port to pick a different port.\n\
+                 To free the port: fuser -k {}/tcp",
+                port,
+                port
+            );
+        }
+    }
+}
+
+/// Check for tsx 4.20.0 which has known issues.
+fn check_tsx_version(backend_dir: &Path) -> Result<()> {
+    let output = Command::new("npx")
+        .args(["tsx", "--version"])
+        .current_dir(backend_dir)
+        .output();
+
+    if let Ok(output) = output {
+        let version = String::from_utf8_lossy(&output.stdout);
+        if version.trim() == "4.20.0" {
+            anyhow::bail!(
+                "tsx 4.20.0 has known issues that affect the web server.\n\
+                 Fix: npm install tsx@^4.21.0 -w @ralph-web/server"
+            );
+        }
+    }
+    // If we can't run tsx or it doesn't match, proceed silently
+    Ok(())
+}
+
+/// Run pre-flight checks: verify Node.js/npm, check tsx, and auto-install dependencies.
+async fn preflight(root: &Path, backend_dir: &Path) -> Result<()> {
     let node_version = check_node()?;
     let npm_version = check_npm()?;
     println!(
@@ -150,17 +191,60 @@ async fn preflight(root: &Path) -> Result<()> {
         run_npm_install(root).await?;
     }
 
+    check_tsx_version(backend_dir)?;
+
     Ok(())
+}
+
+/// Forward output from a child process, prefixing each line with a label.
+/// Notifies `ready` when the output contains the given ready pattern.
+async fn forward_output(
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    label: &str,
+    ready_pattern: &str,
+    ready: std::sync::Arc<Notify>,
+) {
+    let label_out = label.to_string();
+    let label_err = label.to_string();
+    let pattern_out = ready_pattern.to_string();
+    let pattern_err = ready_pattern.to_string();
+    let ready_out = ready.clone();
+    let ready_err = ready;
+
+    let stdout_task = tokio::spawn(async move {
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut notified = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            println!("[{}] {}", label_out, line);
+            if !notified && line.contains(&pattern_out) {
+                ready_out.notify_one();
+                notified = true;
+            }
+        }
+    });
+
+    let stderr_task = tokio::spawn(async move {
+        let reader = BufReader::new(stderr);
+        let mut lines = reader.lines();
+        let mut notified = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            eprintln!("[{}] {}", label_err, line);
+            if !notified && line.contains(&pattern_err) {
+                ready_err.notify_one();
+                notified = true;
+            }
+        }
+    });
+
+    // Run both forwarding tasks to completion (they end when the process closes its pipes)
+    let _ = tokio::join!(stdout_task, stderr_task);
 }
 
 /// Run both backend and frontend dev servers in parallel
 pub async fn execute(args: WebArgs) -> Result<()> {
-    println!("🌐 Starting Ralph web servers...");
-    println!(
-        "   Backend: http://localhost:{}\n   Frontend: http://localhost:{}",
-        args.backend_port, args.frontend_port
-    );
-    println!();
+    println!("Starting Ralph web servers...");
 
     // Determine workspace root: explicit flag or current directory
     let workspace_root = match args.workspace {
@@ -172,22 +256,29 @@ pub async fn execute(args: WebArgs) -> Result<()> {
         None => env::current_dir().context("Failed to get current directory")?,
     };
 
-    // Verify Node.js/npm and auto-install dependencies if needed
-    preflight(&workspace_root).await?;
-
-    println!("Using workspace: {}", workspace_root.display());
-
     // Compute absolute paths for backend and frontend directories
-    // This ensures they work correctly regardless of where `ralph web` is invoked from
     let backend_dir = workspace_root.join("backend/ralph-web-server");
     let frontend_dir = workspace_root.join("frontend/ralph-web");
 
-    // Spawn backend server
+    // Verify Node.js/npm, check tsx version, and auto-install dependencies if needed
+    preflight(&workspace_root, &backend_dir).await?;
+
+    // Check ports before spawning anything
+    check_port_available(args.backend_port)?;
+    check_port_available(args.frontend_port)?;
+
+    println!("Using workspace: {}", workspace_root.display());
+
+    // Spawn backend server with piped output
     // Pass RALPH_WORKSPACE_ROOT so the backend knows where to spawn ralph run from
+    // Pass PORT so the backend listens on the configured port
     let mut backend = AsyncCommand::new("npm")
         .args(["run", "dev"])
         .current_dir(&backend_dir)
         .env("RALPH_WORKSPACE_ROOT", &workspace_root)
+        .env("PORT", args.backend_port.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -197,10 +288,20 @@ pub async fn execute(args: WebArgs) -> Result<()> {
             )
         })?;
 
-    // Spawn frontend server
+    // Spawn frontend server with piped output
+    // Pass --port for Vite and RALPH_BACKEND_PORT for proxy config
     let mut frontend = AsyncCommand::new("npm")
-        .args(["run", "dev"])
+        .args([
+            "run",
+            "dev",
+            "--",
+            "--port",
+            &args.frontend_port.to_string(),
+        ])
         .current_dir(&frontend_dir)
+        .env("RALPH_BACKEND_PORT", args.backend_port.to_string())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
             anyhow::anyhow!(
@@ -209,6 +310,75 @@ pub async fn execute(args: WebArgs) -> Result<()> {
                 e
             )
         })?;
+
+    // Take ownership of stdout/stderr pipes
+    let backend_stdout = backend.stdout.take().expect("backend stdout piped");
+    let backend_stderr = backend.stderr.take().expect("backend stderr piped");
+    let frontend_stdout = frontend.stdout.take().expect("frontend stdout piped");
+    let frontend_stderr = frontend.stderr.take().expect("frontend stderr piped");
+
+    // Set up ready detection
+    let backend_ready = std::sync::Arc::new(Notify::new());
+    let frontend_ready = std::sync::Arc::new(Notify::new());
+
+    // Spawn output forwarding tasks
+    let backend_ready_clone = backend_ready.clone();
+    tokio::spawn(async move {
+        forward_output(
+            backend_stdout,
+            backend_stderr,
+            "backend",
+            "Server started on",
+            backend_ready_clone,
+        )
+        .await;
+    });
+
+    let frontend_ready_clone = frontend_ready.clone();
+    tokio::spawn(async move {
+        forward_output(
+            frontend_stdout,
+            frontend_stderr,
+            "frontend",
+            "Local:",
+            frontend_ready_clone,
+        )
+        .await;
+    });
+
+    // Wait for both servers to become ready
+    let dashboard_url = format!("http://localhost:{}", args.frontend_port);
+    let api_url = format!("http://localhost:{}", args.backend_port);
+
+    let ready_result = tokio::time::timeout(READY_TIMEOUT, async {
+        tokio::join!(backend_ready.notified(), frontend_ready.notified());
+    })
+    .await;
+
+    match ready_result {
+        Ok(()) => {
+            println!();
+            println!("Both servers ready!");
+            println!("  Dashboard: {}", dashboard_url);
+            println!("  API:       {}", api_url);
+            println!();
+
+            if !args.no_open {
+                let _ = open::that(&dashboard_url);
+            }
+        }
+        Err(_) => {
+            println!();
+            println!(
+                "Warning: servers did not report ready within {} seconds.",
+                READY_TIMEOUT.as_secs()
+            );
+            println!("They may still be starting. Check the output above for errors.");
+            println!("  Dashboard: {}", dashboard_url);
+            println!("  API:       {}", api_url);
+            println!();
+        }
+    }
 
     println!("Press Ctrl+C to stop both servers");
 

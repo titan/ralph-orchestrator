@@ -47,6 +47,9 @@ ratatui.workspace = true
 # For progress spinners
 indicatif.workspace = true
 
+# For opening URLs in the default browser
+open.workspace = true
+
 # For Unix process group and signal handling
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
