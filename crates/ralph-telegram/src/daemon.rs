@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use ralph_proto::daemon::{DaemonAdapter, StartLoopFn};
 
@@ -75,11 +75,16 @@ impl DaemonAdapter for TelegramDaemon {
         {
             let flag = shutdown.clone();
             tokio::spawn(async move {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("Failed to register SIGTERM handler");
-                sigterm.recv().await;
-                flag.store(true, Ordering::Relaxed);
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(mut sigterm) => {
+                        sigterm.recv().await;
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to register SIGTERM handler");
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                }
             });
         }
 
