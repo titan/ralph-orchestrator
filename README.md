@@ -99,6 +99,16 @@ npm run dev:legacy-server  # deprecated Node backend (optional)
 npm run test             # all frontend/backend workspace tests
 ```
 
+## MCP Server Mode
+
+Ralph can run as an MCP server over stdio for MCP-compatible clients:
+
+```bash
+ralph mcp serve
+```
+
+Use this mode from an MCP client configuration rather than an interactive terminal workflow.
+
 ## What is Ralph?
 
 Ralph implements the [Ralph Wiggum technique](https://ghuntley.com/ralph/) — autonomous task completion through continuous iteration. It supports:
