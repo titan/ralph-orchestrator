@@ -1744,15 +1744,11 @@ async fn run_command(
 
     // Handle restart: run required single-command restart sequence.
     if matches!(reason, TerminationReason::RestartRequested) {
-        let restart_path = std::path::Path::new(&workspace_root).join(".ralph/restart-requested");
-        let _ = std::fs::remove_file(&restart_path);
+        clear_restart_request_signal(&workspace_root);
 
         #[cfg(unix)]
         {
-            let pid = std::process::id();
-            let restart_cmd = format!(
-                "kill {pid} && RALPH_DIAGNOSTICS=1 cargo run --bin ralph -- resume -c ralph.test.yml"
-            );
+            let restart_cmd = required_restart_command(std::process::id());
             info!(
                 "Restart requested — launching single-command restart: {}",
                 restart_cmd
@@ -1782,6 +1778,15 @@ async fn run_command(
     }
 
     Ok(())
+}
+
+fn required_restart_command(pid: u32) -> String {
+    format!("kill {pid} && RALPH_DIAGNOSTICS=1 cargo run --bin ralph -- resume -c ralph.test.yml")
+}
+
+fn clear_restart_request_signal(workspace_root: &std::path::Path) {
+    let restart_path = workspace_root.join(".ralph/restart-requested");
+    let _ = std::fs::remove_file(&restart_path);
 }
 
 /// Arguments needed for subprocess TUI mode.
@@ -2726,6 +2731,31 @@ mod tests {
     use ralph_core::{HookMutationConfig, HookOnError, HookPhaseEvent, HookSpec};
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_required_restart_command_matches_contract() {
+        let command = required_restart_command(4242);
+        assert_eq!(
+            command,
+            "kill 4242 && RALPH_DIAGNOSTICS=1 cargo run --bin ralph -- resume -c ralph.test.yml"
+        );
+    }
+
+    #[test]
+    fn test_clear_restart_request_signal_removes_sentinel_file() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let restart_dir = temp_dir.path().join(".ralph");
+        std::fs::create_dir_all(&restart_dir).expect("create .ralph dir");
+        let restart_path = restart_dir.join("restart-requested");
+        std::fs::write(&restart_path, "requested").expect("write sentinel");
+
+        clear_restart_request_signal(temp_dir.path());
+
+        assert!(
+            !restart_path.exists(),
+            "restart sentinel should be removed before restart command dispatch"
+        );
+    }
 
     #[test]
     fn test_verbosity_cli_quiet() {
