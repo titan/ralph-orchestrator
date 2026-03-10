@@ -1,6 +1,6 @@
 # PDD-to-Code-Assist: Full PDD + Code-Assist Autonomous Workflow
 # Pattern: Self-Debate Through Adversarial Gates
-# Ralph debates with himself from rough idea to committed, tested code
+# Uses adversarial self-debate to move from rough idea to committed, tested code
 #
 # Combines:
 # - PDD (Prompt-Driven Development) for design through iterative Q&A
@@ -527,7 +527,7 @@ hats:
           - the backing `.code-task.md` file path
 
       ### Process On `queue.advance`
-      1. Re-read `plan.md`, `progress.md`, all code task files, and `.ralph/agent/tasks.jsonl`
+      1. Re-read `plan.md`, `progress.md`, all code task files, and the current runtime task state
       2. Identify the current numbered implementation step from `progress.md`
       3. If open or ready runtime tasks already exist for that step, publish `tasks.ready` for the next one
       4. If the current step's wave is fully closed, mark it complete in `progress.md`
