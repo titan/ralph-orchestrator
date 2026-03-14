@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = TelegramService::new(
         PathBuf::from("."),
         Some("1234567890:abcdefg_hijklmnop".to_string()),
+        None, // api_url
         300,
         "loop-1".to_string(),
     )?;

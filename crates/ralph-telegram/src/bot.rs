@@ -41,21 +41,25 @@ pub struct TelegramBot {
 }
 
 impl TelegramBot {
-    /// Create a new TelegramBot from a bot token.
-    pub fn new(token: &str) -> Self {
-        if cfg!(test) {
+    /// Create a new TelegramBot from a bot token and optional custom API URL.
+    ///
+    /// When `api_url` is provided, all Telegram API requests are sent to that
+    /// URL instead of the default `https://api.telegram.org`. This enables
+    /// targeting a local mock server (e.g., `telegram-test-api`) for CI/CD.
+    pub fn new(token: &str, api_url: Option<&str>) -> Self {
+        let bot = if cfg!(test) {
             let client = teloxide::net::default_reqwest_settings()
                 .no_proxy()
                 .build()
                 .expect("Client creation failed");
-            Self {
-                bot: teloxide::Bot::with_client(token, client),
-            }
+            teloxide::Bot::with_client(token, client)
         } else {
-            Self {
-                bot: teloxide::Bot::new(token),
-            }
-        }
+            teloxide::Bot::new(token)
+        };
+
+        let bot = crate::apply_api_url(bot, api_url);
+
+        Self { bot }
     }
 
     /// Format an outgoing question message using Telegram HTML.

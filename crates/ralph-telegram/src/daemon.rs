@@ -35,6 +35,7 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
 /// `SIGINT`/`SIGTERM`.
 pub struct TelegramDaemon {
     bot_token: String,
+    api_url: Option<String>,
     chat_id: i64,
 }
 
@@ -42,9 +43,14 @@ impl TelegramDaemon {
     /// Create a new Telegram daemon.
     ///
     /// `bot_token` — Telegram Bot API token.
+    /// `api_url` — Optional custom Telegram Bot API URL.
     /// `chat_id` — The Telegram chat to communicate with.
-    pub fn new(bot_token: String, chat_id: i64) -> Self {
-        Self { bot_token, chat_id }
+    pub fn new(bot_token: String, api_url: Option<String>, chat_id: i64) -> Self {
+        Self {
+            bot_token,
+            api_url,
+            chat_id,
+        }
     }
 }
 
@@ -55,7 +61,7 @@ impl DaemonAdapter for TelegramDaemon {
         workspace_root: PathBuf,
         start_loop: StartLoopFn,
     ) -> anyhow::Result<()> {
-        let bot = TelegramBot::new(&self.bot_token);
+        let bot = TelegramBot::new(&self.bot_token, self.api_url.as_deref());
         let chat_id = self.chat_id;
 
         let state_manager = StateManager::new(workspace_root.join(".ralph/telegram-state.json"));
@@ -98,7 +104,7 @@ impl DaemonAdapter for TelegramDaemon {
                 _ = wait_for_shutdown(shutdown.clone()) => {
                     break 'daemon;
                 }
-                updates = poll_updates(&self.bot_token, 30, offset) => updates,
+                updates = poll_updates(&self.bot_token, self.api_url.as_deref(), 30, offset) => updates,
             } {
                 Ok(u) => u,
                 Err(e) => {
@@ -234,13 +240,14 @@ struct DaemonUpdate {
 /// since `ralph-telegram` already depends on teloxide.
 async fn poll_updates(
     token: &str,
+    api_url: Option<&str>,
     timeout_secs: u64,
     offset: i32,
 ) -> anyhow::Result<Vec<DaemonUpdate>> {
     use teloxide::payloads::GetUpdatesSetters;
     use teloxide::requests::Requester;
 
-    let bot = teloxide::Bot::new(token);
+    let bot = crate::apply_api_url(teloxide::Bot::new(token), api_url);
     let request = bot
         .get_updates()
         .offset(offset)
@@ -275,8 +282,21 @@ mod tests {
 
     #[test]
     fn test_telegram_daemon_creation() {
-        let daemon = TelegramDaemon::new("test-token".to_string(), 12345);
+        let daemon = TelegramDaemon::new("test-token".to_string(), None, 12345);
         assert_eq!(daemon.bot_token, "test-token");
+        assert_eq!(daemon.api_url, None);
+        assert_eq!(daemon.chat_id, 12345);
+    }
+
+    #[test]
+    fn test_telegram_daemon_with_api_url() {
+        let daemon = TelegramDaemon::new(
+            "test-token".to_string(),
+            Some("http://localhost:8081".to_string()),
+            12345,
+        );
+        assert_eq!(daemon.bot_token, "test-token");
+        assert_eq!(daemon.api_url, Some("http://localhost:8081".to_string()));
         assert_eq!(daemon.chat_id, 12345);
     }
 }

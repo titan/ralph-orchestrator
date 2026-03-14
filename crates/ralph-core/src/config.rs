@@ -1831,6 +1831,19 @@ impl RobotConfig {
                 .flatten()
             })
     }
+
+    /// Resolves the custom Telegram API URL from multiple sources.
+    ///
+    /// Resolution order (highest to lowest priority):
+    /// 1. `RALPH_TELEGRAM_API_URL` environment variable
+    /// 2. `RObot.telegram.api_url` in config file
+    pub fn resolve_api_url(&self) -> Option<String> {
+        std::env::var("RALPH_TELEGRAM_API_URL").ok().or_else(|| {
+            self.telegram
+                .as_ref()
+                .and_then(|telegram| telegram.api_url.clone())
+        })
+    }
 }
 
 /// Telegram bot configuration.
@@ -1838,6 +1851,12 @@ impl RobotConfig {
 pub struct TelegramBotConfig {
     /// Bot token. Optional if `RALPH_TELEGRAM_BOT_TOKEN` env var is set.
     pub bot_token: Option<String>,
+
+    /// Custom Telegram Bot API URL. Optional; when set, all API requests
+    /// are sent to this URL instead of the default `https://api.telegram.org`.
+    /// Useful for targeting a local mock server (e.g., `telegram-test-api`)
+    /// in CI/CD. Can also be set via `RALPH_TELEGRAM_API_URL` env var.
+    pub api_url: Option<String>,
 }
 
 /// Configuration errors.
@@ -3272,6 +3291,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: Some(TelegramBotConfig {
                 bot_token: Some("config-token".to_string()),
+                api_url: None,
             }),
         };
 
@@ -3310,6 +3330,7 @@ RObot:
             checkin_interval_seconds: None,
             telegram: Some(TelegramBotConfig {
                 bot_token: Some("test-token".to_string()),
+                api_url: None,
             }),
         };
         assert!(robot.validate().is_ok());
@@ -3352,7 +3373,10 @@ RObot:
             enabled: true,
             timeout_seconds: Some(300),
             checkin_interval_seconds: None,
-            telegram: Some(TelegramBotConfig { bot_token: None }),
+            telegram: Some(TelegramBotConfig {
+                bot_token: None,
+                api_url: None,
+            }),
         };
         let result = robot.validate();
         assert!(result.is_err());

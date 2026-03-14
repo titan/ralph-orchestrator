@@ -48,6 +48,7 @@ RObot:
   checkin_interval_seconds: 120    # Periodic status updates (optional)
   telegram:
     bot_token: "your-bot-token"    # Or use RALPH_TELEGRAM_BOT_TOKEN env var
+    api_url: "http://localhost:8081"  # Optional: custom Bot API URL (for testing)
 ```
 
 | Field | Required | Description |
@@ -56,6 +57,7 @@ RObot:
 | `timeout_seconds` | Yes | Seconds to wait for a human reply before continuing |
 | `checkin_interval_seconds` | No | Send periodic "still working" status updates |
 | `telegram.bot_token` | Yes* | Bot token from BotFather (*or set via env var) |
+| `telegram.api_url` | No | Custom Telegram Bot API URL (or `RALPH_TELEGRAM_API_URL` env var) |
 
 For long-running loops, increase `timeout_seconds` and set `checkin_interval_seconds`:
 
@@ -202,6 +204,56 @@ cargo test -p ralph-core human        # 11 integration tests in ralph-core
 ```
 
 All tests use a `MockBot` implementation of `BotApi` — no Telegram API calls are made during testing.
+
+## Testing with a Mock Telegram Server
+
+When developing custom hats that use `human.interact`, you can test the full human-in-the-loop flow locally without a real Telegram bot by pointing Ralph at a mock Telegram Bot API server.
+
+### 1. Start a Mock Server
+
+[telegram-test-api](https://github.com/nickolay/telegram-test-api) is a Docker-based mock that implements the Telegram Bot API:
+
+```bash
+docker run -d --name telegram-mock -p 8081:8081 \
+  ghcr.io/nickolay/telegram-test-api:latest
+```
+
+### 2. Point Ralph at It
+
+**Option A: Environment variable**
+
+```bash
+export RALPH_TELEGRAM_API_URL="http://localhost:8081"
+export RALPH_TELEGRAM_BOT_TOKEN="test-token"
+```
+
+**Option B: Config file**
+
+```yaml
+# ralph.yml
+RObot:
+  enabled: true
+  timeout_seconds: 30
+  telegram:
+    bot_token: "test-token"
+    api_url: "http://localhost:8081"
+```
+
+The environment variable takes precedence over the config file value.
+
+### 3. Run Your Loop
+
+```bash
+ralph run -p "your prompt" --max-iterations 5
+```
+
+The bot sends all API requests to the mock server instead of `https://api.telegram.org`. You can inspect requests, simulate replies, and verify that your hats emit the right `human.interact` events — all without touching real Telegram.
+
+### Use Cases
+
+- **Custom hat development**: Verify that your hats ask the right questions at the right time
+- **CI/CD pipelines**: Run HIL integration tests without network access or bot tokens
+- **Debugging**: Inspect the exact payloads Ralph sends to the Telegram API
 
 ## Troubleshooting
 

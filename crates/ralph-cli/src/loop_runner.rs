@@ -4814,13 +4814,20 @@ fn create_robot_service(
 ) -> Option<Box<dyn ralph_proto::RobotService>> {
     let workspace_root = context.workspace().to_path_buf();
     let bot_token = config.robot.resolve_bot_token();
+    let api_url = config.robot.resolve_api_url();
     let timeout_secs = config.robot.timeout_seconds.unwrap_or(300);
     let loop_id = context
         .loop_id()
         .map(String::from)
         .unwrap_or_else(|| "main".to_string());
 
-    match ralph_telegram::TelegramService::new(workspace_root, bot_token, timeout_secs, loop_id) {
+    match ralph_telegram::TelegramService::new(
+        workspace_root,
+        bot_token,
+        api_url,
+        timeout_secs,
+        loop_id,
+    ) {
         Ok(service) => {
             if let Err(e) = service.start() {
                 warn!(error = %e, "Failed to start robot service");

@@ -564,8 +564,13 @@ async fn run_daemon(
         println!("Ralph Daemon (Telegram)");
     }
 
+    // Resolve custom API URL (env var > config file)
+    let api_url = std::env::var("RALPH_TELEGRAM_API_URL")
+        .ok()
+        .or_else(|| load_config_api_url_from(&config_path));
+
     // Build the adapter
-    let adapter = ralph_telegram::TelegramDaemon::new(token, chat_id);
+    let adapter = ralph_telegram::TelegramDaemon::new(token, api_url, chat_id);
 
     // Build the start_loop callback — wraps our CLI loop runner
     let start_loop: ralph_proto::StartLoopFn = Box::new(move |prompt: String| {
@@ -955,6 +960,19 @@ fn load_config_bot_token_from(path: &Path) -> Option<String> {
 /// Read bot token from ralph.yml (legacy).
 fn load_config_bot_token() -> Option<String> {
     load_config_bot_token_from(Path::new("ralph.yml"))
+}
+
+/// Read custom Telegram API URL from a config file.
+fn load_config_api_url_from(path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let config: serde_yaml::Value = serde_yaml::from_str(&content).ok()?;
+    config
+        .get("RObot")
+        .or_else(|| config.get("robot"))
+        .and_then(|r| r.get("telegram"))
+        .and_then(|t| t.get("api_url"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Check if RObot is enabled in config.

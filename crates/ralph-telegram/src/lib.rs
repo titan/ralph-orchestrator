@@ -32,3 +32,21 @@ pub use service::{
     BASE_RETRY_DELAY, CheckinContext, MAX_SEND_RETRIES, TelegramService, retry_with_backoff,
 };
 pub use state::{PendingQuestion, StateManager, TelegramState};
+
+/// Apply an optional custom API URL to a teloxide Bot instance.
+///
+/// Parses the URL and calls `set_api_url` on the bot. Warns on invalid URLs
+/// and returns the bot unchanged.
+pub(crate) fn apply_api_url(mut bot: teloxide::Bot, api_url: Option<&str>) -> teloxide::Bot {
+    if let Some(raw) = api_url {
+        match url::Url::parse(raw) {
+            Ok(parsed) => {
+                bot = bot.set_api_url(parsed);
+            }
+            Err(e) => {
+                tracing::warn!(url = %raw, error = %e, "Invalid Telegram API URL — using default");
+            }
+        }
+    }
+    bot
+}

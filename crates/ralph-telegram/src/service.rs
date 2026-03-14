@@ -85,6 +85,7 @@ pub struct CheckinContext {
 pub struct TelegramService {
     workspace_root: PathBuf,
     bot_token: String,
+    api_url: Option<String>,
     timeout_secs: u64,
     loop_id: String,
     state_manager: StateManager,
@@ -97,9 +98,12 @@ impl TelegramService {
     /// Create a new TelegramService.
     ///
     /// Resolves the bot token from config or `RALPH_TELEGRAM_BOT_TOKEN` env var.
+    /// When `api_url` is provided, all Telegram API requests target that URL
+    /// instead of the default `https://api.telegram.org`.
     pub fn new(
         workspace_root: PathBuf,
         bot_token: Option<String>,
+        api_url: Option<String>,
         timeout_secs: u64,
         loop_id: String,
     ) -> TelegramResult<Self> {
@@ -111,12 +115,13 @@ impl TelegramService {
         let state_manager = StateManager::new(&state_path);
         let handler_state_manager = StateManager::new(&state_path);
         let handler = MessageHandler::new(handler_state_manager, &workspace_root);
-        let bot = TelegramBot::new(&resolved_token);
+        let bot = TelegramBot::new(&resolved_token, api_url.as_deref());
         let shutdown = Arc::new(AtomicBool::new(false));
 
         Ok(Self {
             workspace_root,
             bot_token: resolved_token,
+            api_url,
             timeout_secs,
             loop_id,
             state_manager,
@@ -189,7 +194,8 @@ impl TelegramService {
             TelegramError::Startup("no tokio runtime available for polling".to_string())
         })?;
 
-        let raw_bot = teloxide::Bot::new(&self.bot_token);
+        let raw_bot =
+            crate::apply_api_url(teloxide::Bot::new(&self.bot_token), self.api_url.as_deref());
         let workspace_root = self.workspace_root.clone();
         let state_path = self.workspace_root.join(".ralph/telegram-state.json");
         let shutdown = self.shutdown.clone();
@@ -811,6 +817,7 @@ mod tests {
         TelegramService::new(
             dir.path().to_path_buf(),
             Some("test-token-12345".to_string()),
+            None,
             300,
             "main".to_string(),
         )
@@ -823,6 +830,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("test-token-12345".to_string()),
+            None,
             300,
             "main".to_string(),
         );
@@ -838,7 +846,13 @@ mod tests {
         }
 
         let dir = TempDir::new().unwrap();
-        let service = TelegramService::new(dir.path().to_path_buf(), None, 300, "main".to_string());
+        let service = TelegramService::new(
+            dir.path().to_path_buf(),
+            None,
+            None,
+            300,
+            "main".to_string(),
+        );
         assert!(service.is_err());
         assert!(matches!(
             service.unwrap_err(),
@@ -852,6 +866,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("abcd1234efgh5678".to_string()),
+            None,
             300,
             "main".to_string(),
         )
@@ -866,6 +881,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("token".to_string()),
+            None,
             60,
             "feature-auth".to_string(),
         )
@@ -1024,6 +1040,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("token".to_string()),
+            None,
             5, // enough time for the writer thread
             "main".to_string(),
         )
@@ -1071,6 +1088,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("token".to_string()),
+            None,
             1, // 1 second timeout
             "main".to_string(),
         )
@@ -1271,6 +1289,7 @@ mod tests {
         let service = TelegramService::new(
             dir.path().to_path_buf(),
             Some("token".to_string()),
+            None,
             60, // long timeout — shutdown flag should preempt it
             "main".to_string(),
         )

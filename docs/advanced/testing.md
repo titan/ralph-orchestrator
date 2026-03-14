@@ -217,6 +217,24 @@ Hooks run CI-parity Rust checks before each commit:
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test`
 
+## Testing Human-in-the-Loop (Telegram)
+
+To test custom hats that use `human.interact` without a real Telegram bot, point Ralph at a mock Telegram Bot API server:
+
+```bash
+# Start a mock server
+docker run -d -p 8081:8081 ghcr.io/nickolay/telegram-test-api:latest
+
+# Point Ralph at it
+export RALPH_TELEGRAM_API_URL="http://localhost:8081"
+export RALPH_TELEGRAM_BOT_TOKEN="test-token"
+
+# Run your loop
+ralph run -p "your prompt" --max-iterations 5
+```
+
+Or set `RObot.telegram.api_url` in your `ralph.yml`. See the full [Telegram testing guide](../guide/telegram.md#testing-with-a-mock-telegram-server) for details.
+
 ## Testing Best Practices
 
 ### 1. Run Tests After Changes

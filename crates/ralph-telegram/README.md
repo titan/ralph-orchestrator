@@ -32,9 +32,20 @@ RObot:
   timeout_seconds: 300
   telegram:
     bot_token: "your-bot-token"
+    api_url: "http://localhost:8081"  # Optional: custom Bot API URL
 ```
 
 The environment variable takes precedence over the config file value.
+
+#### Custom API URL
+
+To target a mock Telegram server (e.g., for CI or local HIL testing), set a custom API URL:
+
+```bash
+export RALPH_TELEGRAM_API_URL="http://localhost:8081"
+```
+
+Or use `RObot.telegram.api_url` in the config file. See the [Telegram guide](../../docs/guide/telegram.md#testing-with-a-mock-telegram-server) for a full walkthrough.
 
 ### 3. Start a Loop
 
