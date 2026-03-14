@@ -110,11 +110,21 @@ impl LoopState {
         self.started_at.elapsed()
     }
 
+    fn event_counts_toward_stale_loop(event: &Event) -> bool {
+        !matches!(event.topic.as_str(), "task.complete")
+    }
+
     /// Record that an event has been seen during this loop run.
     ///
     /// Also tracks consecutive same-signature emissions for stale loop detection.
     pub fn record_event(&mut self, event: &Event) {
         self.seen_topics.insert(event.topic.to_string());
+
+        if !Self::event_counts_toward_stale_loop(event) {
+            self.consecutive_same_signature = 0;
+            self.last_emitted_signature = Some(EventSignature::from_event(event));
+            return;
+        }
 
         let signature = EventSignature::from_event(event);
         if self.last_emitted_signature.as_ref() == Some(&signature) {
@@ -148,4 +158,48 @@ fn fingerprint_payload(payload: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     payload.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoopState;
+    use ralph_proto::Event;
+
+    #[test]
+    fn repeated_task_complete_does_not_accumulate_stale_loop_count() {
+        let mut state = LoopState::new();
+
+        state.record_event(&Event::new("task.complete", "task 1 complete"));
+        assert_eq!(state.consecutive_same_signature, 0);
+
+        state.record_event(&Event::new("task.complete", "task 2 complete"));
+        state.record_event(&Event::new("task.complete", "task 3 complete"));
+
+        assert_eq!(state.consecutive_same_signature, 0);
+        assert_eq!(
+            state
+                .last_emitted_signature
+                .as_ref()
+                .map(|s| s.topic.as_str()),
+            Some("task.complete")
+        );
+    }
+
+    #[test]
+    fn repeated_non_progress_topics_still_accumulate_stale_loop_count() {
+        let mut state = LoopState::new();
+
+        state.record_event(&Event::new("task.resume", "same payload"));
+        state.record_event(&Event::new("task.resume", "same payload"));
+        state.record_event(&Event::new("task.resume", "same payload"));
+
+        assert_eq!(state.consecutive_same_signature, 3);
+        assert_eq!(
+            state
+                .last_emitted_signature
+                .as_ref()
+                .map(|s| s.topic.as_str()),
+            Some("task.resume")
+        );
+    }
 }
