@@ -1,5 +1,10 @@
 [
   {
+    "name": "autoresearch",
+    "description": "Autonomous experiment loop: try ideas, measure, keep what works, discard what doesn't",
+    "category": "optimization"
+  },
+  {
     "name": "code-assist",
     "description": "Default implementation workflow with TDD and adversarial validation",
     "category": "development"

@@ -24,6 +24,12 @@ pub struct EmbeddedPreset {
 /// All embedded presets, compiled into the binary.
 const PRESETS: &[EmbeddedPreset] = &[
     EmbeddedPreset {
+        name: "autoresearch",
+        description: "Autonomous experiment loop: try ideas, measure, keep what works, discard what doesn't",
+        content: include_str!("../presets/autoresearch.yml"),
+        public: true,
+    },
+    EmbeddedPreset {
         name: "code-assist",
         description: "Default implementation workflow with TDD and adversarial validation",
         content: include_str!("../presets/code-assist.yml"),
@@ -128,7 +134,7 @@ mod tests {
     #[test]
     fn test_list_presets_returns_all() {
         let presets = list_presets();
-        assert_eq!(presets.len(), 5, "Expected 5 public presets");
+        assert_eq!(presets.len(), 6, "Expected 6 public presets");
     }
 
     #[test]
@@ -202,7 +208,8 @@ mod tests {
     #[test]
     fn test_preset_names_returns_all_names() {
         let names = preset_names();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 6);
+        assert!(names.contains(&"autoresearch"));
         assert!(names.contains(&"debug"));
         assert!(names.contains(&"code-assist"));
         assert!(names.contains(&"research"));

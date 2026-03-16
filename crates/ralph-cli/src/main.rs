@@ -205,7 +205,7 @@ pub(crate) fn resolve_path_from_workspace(
     resolve_workspace_root(root).join(path)
 }
 
-fn discover_workspace_root(start: &Path) -> Option<PathBuf> {
+pub(crate) fn discover_workspace_root(start: &Path) -> Option<PathBuf> {
     start.ancestors().find_map(|dir| {
         let has_ralph = dir.join(".ralph").is_dir();
         let has_git = dir.join(".git").exists();
@@ -2403,8 +2403,16 @@ fn clean_command(
 /// Events are written to the path specified in `.ralph/current-events` marker file
 /// (created by `ralph run`), or falls back to `.ralph/events.jsonl` if no marker exists.
 fn emit_command(color_mode: ColorMode, args: EmitArgs) -> Result<()> {
+    emit_command_with_root(color_mode, args, None)
+}
+
+fn emit_command_with_root(
+    color_mode: ColorMode,
+    args: EmitArgs,
+    root: Option<&PathBuf>,
+) -> Result<()> {
     let use_colors = color_mode.should_use_colors();
-    let workspace_root = resolve_workspace_root(None);
+    let workspace_root = resolve_workspace_root(root);
     let current_events_marker = workspace_root.join(".ralph/current-events");
 
     // Generate timestamp if not provided
@@ -2995,26 +3003,25 @@ mod tests {
         std::fs::create_dir_all(temp_dir.path().join(".ralph")).expect("ralph dir");
         let nested = temp_dir.path().join("a/b/c");
         std::fs::create_dir_all(&nested).expect("nested dir");
-        let _cwd = CwdGuard::set(&nested);
 
-        assert_eq!(resolve_workspace_root(None), temp_dir.path().to_path_buf());
+        assert_eq!(
+            discover_workspace_root(&nested),
+            Some(temp_dir.path().to_path_buf())
+        );
     }
 
     #[test]
     fn test_emit_command_resolves_marker_relative_to_workspace_root_from_nested_dir() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let workspace = temp_dir.path();
+        let workspace = temp_dir.path().to_path_buf();
         std::fs::create_dir_all(workspace.join(".ralph")).expect("ralph dir");
         std::fs::write(
             workspace.join(".ralph/current-events"),
             ".ralph/events-20260309-test.jsonl\n",
         )
         .expect("write marker");
-        let nested = workspace.join("nested/project");
-        std::fs::create_dir_all(&nested).expect("nested dir");
-        let _cwd = CwdGuard::set(&nested);
 
-        emit_command(
+        emit_command_with_root(
             ColorMode::Never,
             EmitArgs {
                 topic: "debug.step".to_string(),
@@ -3023,6 +3030,7 @@ mod tests {
                 ts: Some("2026-03-09T00:00:00Z".to_string()),
                 file: PathBuf::from(".ralph/events.jsonl"),
             },
+            Some(&workspace),
         )
         .expect("emit command");
 

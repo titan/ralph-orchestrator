@@ -1,0 +1,359 @@
+# Autoresearch Preset
+#
+# Autonomous experiment loop: try ideas, measure, keep what works, discard what doesn't.
+# Inspired by karpathy/autoresearch, adapted for ralph's hat-based orchestration.
+#
+# Works for ANY measurable improvement: performance, code quality, test coverage,
+# bundle size, error rates, documentation completeness, security scores, etc.
+#
+# The loop runs until interrupted. Each cycle: strategize -> implement -> measure -> evaluate.
+# State persists in autoresearch.md and autoresearch.jsonl.
+#
+# 4 Hats:
+# - Strategist: Decides what experiment to try next
+# - Implementer: Executes the planned change
+# - Benchmarker: Runs the measurement command and captures metrics
+# - Evaluator: Decides keep/discard, commits or reverts, updates records
+#
+# Usage:
+#   ralph run --config presets/autoresearch.yml --prompt "Optimize test suite runtime"
+#   ralph run --config presets/autoresearch.yml --prompt "Improve test coverage in src/core/"
+#   ralph run --config presets/autoresearch.yml --prompt "Reduce bundle size in src/build/"
+#   ralph run --config presets/autoresearch.yml --prompt "Improve code quality score (reduce complexity, lint warnings)"
+#   ralph run --config presets/autoresearch.yml --prompt "Minimize cold-start latency for the Lambda handler"
+
+event_loop:
+  prompt_file: "PROMPT.md"
+  completion_promise: "LOOP_COMPLETE"
+  required_events: ["experiment.measured", "experiment.evaluated"]
+  starting_event: "experiment.start"
+  max_iterations: 500
+  max_runtime_seconds: 28800   # 8 hours
+  checkpoint_interval: 5
+  max_consecutive_failures: 5  # Stop after 5 consecutive crashes
+  idle_timeout_secs: 300       # 5 min timeout per hat turn
+
+cli:
+  backend: "claude"
+  prompt_mode: "arg"
+
+core:
+  specs_dir: ".agents/scratchpad/"
+  guardrails:
+    - "Fresh context each iteration — re-read autoresearch.md and git log every time"
+    - "Primary metric is king — improved = keep, worse/equal = discard"
+    - "Be careful not to overfit to benchmarks and do not cheat on benchmarks"
+    - "Simpler is better — removing code for equal metric = keep"
+    - "One change at a time — each experiment tests exactly one hypothesis"
+    - "Don't thrash — if repeatedly reverting the same idea, try something structurally different"
+    - "Think longer when stuck — re-read source files, study the data, reason about root causes"
+
+hats:
+  strategist:
+    name: "Strategist"
+    description: "Decides what experiment to try next based on experiment history and deep source understanding."
+    triggers: ["experiment.start", "experiment.evaluated", "experiment.blocked"]
+    publishes: ["experiment.planned", "LOOP_COMPLETE"]
+    default_publishes: "experiment.planned"
+    instructions: |
+      ## STRATEGIST MODE — Decide The Next Experiment
+
+      Start from the auto-injected objective and current event context.
+      You are running inside Ralph. `ralph emit`, `ralph tools task`, and `ralph tools memory` are available.
+      The loop also sets `$RALPH_BIN`; prefer `"$RALPH_BIN" tools ...` and `"$RALPH_BIN" emit ...` for task/event commands.
+
+      You own the experiment strategy. You decide WHAT to try, not HOW to implement it.
+      Your plans must be specific enough that the Implementer can execute without ambiguity.
+
+      ### Resuming (experiment.start, autoresearch.md already exists)
+
+      If `autoresearch.md` already exists, this is a resume after context limit or restart:
+      1. Re-read `autoresearch.md` completely — especially "What's Been Tried"
+      2. Read `autoresearch.jsonl` tail for the latest experiment results
+      3. Read `git log --oneline -20` for recent commits
+      4. Check `autoresearch.ideas.md` if it exists for promising paths
+      5. Continue where the previous session left off — pick the next experiment
+      6. Ensure a runtime task and emit `experiment.planned` as in subsequent activations
+
+      ### Fresh Session (experiment.start, no autoresearch.md)
+
+      If `autoresearch.md` does not exist, this is a fresh session. Set up:
+
+      1. Infer from the prompt: **Goal**, **Command** (the benchmark command to run), **Metric** (name, unit, direction), **Files in scope**, **Constraints**
+      2. Create a branch: `git checkout -b autoresearch/<goal-slug>-$(date +%Y%m%d)`
+      3. Read ALL files in scope deeply. Understand the workload before writing anything.
+      4. Write `autoresearch.md` with the full session document (see format below)
+      5. If constraints require correctness validation, write `autoresearch.checks.sh` (bash, `set -euo pipefail`)
+      6. Ensure a runtime task: `ralph tools task ensure "Run baseline measurement" --key autoresearch:baseline`
+      7. Emit: `ralph emit "experiment.planned" "task_id=<id> task_key=autoresearch:baseline plan=Run baseline — no code changes, establish reference metric"`
+      8. Stop after emitting.
+
+      ### autoresearch.md Format
+
+      ```markdown
+      # Autoresearch: <goal>
+
+      ## Objective
+      <Specific description of what we're optimizing and the workload.>
+
+      ## Metrics
+      - **Primary**: <name> (<unit>, lower/higher is better)
+      - **Current Best**: <value> (updated by Evaluator after each keep)
+      - **Secondary**: <name>, <name>, ...
+
+      ## Benchmark Command
+      <The exact command the Benchmarker should run, e.g.:>
+      <  Performance: `cargo bench --bench my_bench 2>&1`>
+      <  Coverage: `cargo llvm-cov --json 2>&1`>
+      <  Quality: `npx eslint src/ --format json 2>&1`>
+      <How to parse metrics from the output.>
+
+      ## Files in Scope
+      <Every file the agent may modify, with a brief note on what it does.>
+
+      ## Off Limits
+      <What must NOT be touched.>
+
+      ## Constraints
+      <Hard rules: tests must pass, no new deps, etc.>
+
+      ## What's Been Tried
+      <Updated after each experiment. Note key wins, dead ends, and architectural insights.>
+      ```
+
+      ### Subsequent Activations (experiment.evaluated or experiment.blocked)
+
+      1. Re-read `autoresearch.md` — especially "What's Been Tried" and "Files in Scope"
+      2. Check `<ready-tasks>` for any existing runtime tasks before creating new ones
+      3. Check `autoresearch.ideas.md` if it exists — prune stale/tried entries, pick promising paths
+      4. Read recent git log (`git log --oneline -20`) for experiment history
+      5. Read `autoresearch.jsonl` tail for recent metric trends
+      6. Re-read the source files in scope. The best ideas come from deep understanding.
+      7. `ralph tools memory search "<goal area>"` for relevant patterns
+      8. Decide the next experiment:
+         - If triggered by `experiment.blocked`, close the blocked task and choose a different approach
+         - If recent experiments show diminishing returns, pivot to a different approach (check `trend` in the last experiment.evaluated payload)
+         - If the same idea keeps getting reverted, try something structurally different
+         - Prefer high-impact, low-risk changes over speculative rewrites
+      9. Ensure a runtime task: `ralph tools task ensure "<description>" --key autoresearch:experiment-<slug>`
+      10. Emit: `ralph emit "experiment.planned" "task_id=<id> task_key=autoresearch:experiment-<slug> plan=<specific actionable plan> hypothesis=<This should improve X because Y>"`
+      11. Stop after emitting.
+
+      ### When Ideas Run Dry
+
+      If you genuinely cannot think of more experiments:
+      1. Re-read ALL source files one more time
+      2. Consider approaches from different angles
+      3. Check if any "What's Been Tried" entries could be combined
+      4. If truly exhausted, update autoresearch.md with a final summary
+      5. Emit: `ralph emit "LOOP_COMPLETE" "All experiment paths exhausted — see autoresearch.md for summary"`
+      6. Stop after emitting. Do NOT send a fake experiment through the pipeline.
+
+      ### Constraints
+      - You MUST NOT implement code changes — that belongs to the Implementer
+      - You MUST NOT invoke `[Tool] Agent` or any parallel subagent tool in this preset
+      - You MUST re-read autoresearch.md every activation — you have fresh context
+      - You MUST provide specific file paths and change descriptions in your plan
+      - You MUST NOT repeat an approach that was already tried and discarded (check "What's Been Tried")
+      - You MUST use `ralph emit` to publish events — plain-language summaries do NOT publish events
+      - You SHOULD record promising but deferred ideas in autoresearch.ideas.md
+      - You SHOULD save durable learnings with `ralph tools memory add`
+
+  implementer:
+    name: "Implementer"
+    description: "Executes the planned change by editing source files."
+    triggers: ["experiment.planned"]
+    publishes: ["experiment.ready", "experiment.blocked"]
+    default_publishes: "experiment.ready"
+    instructions: |
+      ## IMPLEMENTER MODE — Execute The Change
+
+      Start from the auto-injected objective and current event context.
+      You are running inside Ralph. `ralph emit` and `ralph tools task` are available.
+      The loop also sets `$RALPH_BIN`; prefer `"$RALPH_BIN" emit ...` and `"$RALPH_BIN" tools ...`.
+
+      You implement exactly what the Strategist planned. No more, no less.
+
+      ### Process
+
+      1. Read the `experiment.planned` payload for `task_id`, `task_key`, and the plan
+      2. Start the task: `ralph tools task start <task_id>`
+      3. Verify clean working tree: `git status --short`
+      4. If the baseline task (first run, no code changes): skip to step 9
+      5. Read `autoresearch.md` for context on files in scope and constraints
+      6. Read the specific source files mentioned in the plan
+      7. `ralph tools memory search "<change area>"` for relevant patterns
+      8. Implement the change:
+         - Follow the plan precisely
+         - Keep changes minimal and focused
+         - Do not refactor unrelated code
+      9. Verify the change compiles / doesn't crash trivially
+      10. Emit: `ralph emit "experiment.ready" "task_id=<id> task_key=<key> summary=<brief summary of what was changed>"`
+      11. Stop after emitting.
+
+      ### If Blocked
+
+      If the plan is unclear, infeasible, or the change breaks the build:
+      - Attempt a reasonable interpretation first
+      - If truly blocked, revert: `git checkout -- . && git clean -fd`
+      - Emit: `ralph emit "experiment.blocked" "task_id=<id> task_key=<key> reason=<why blocked>"`
+      - Stop after emitting.
+
+      ### Constraints
+      - You MUST NOT invoke `[Tool] Agent` or any parallel subagent tool in this preset
+      - You MUST NOT change files outside the "Files in Scope" section of autoresearch.md
+      - You MUST NOT run the benchmark — the Benchmarker handles measurement
+      - You MUST NOT decide whether to keep or discard — the Evaluator handles that
+      - You MUST NOT make additional "while I'm here" improvements
+      - You MUST keep changes small and reversible with `git checkout -- .`
+      - You MUST use `ralph emit` to publish events — plain-language summaries do NOT publish events
+
+  benchmarker:
+    name: "Benchmarker"
+    description: "Runs the measurement command from autoresearch.md, captures metrics, and runs correctness checks."
+    triggers: ["experiment.ready"]
+    publishes: ["experiment.measured"]
+    default_publishes: "experiment.measured"
+    instructions: |
+      ## BENCHMARKER MODE — Measure The Experiment
+
+      Start from the auto-injected objective and current event context.
+      You are running inside Ralph. `ralph emit` and `ralph tools task` are available.
+      The loop also sets `$RALPH_BIN`; prefer `"$RALPH_BIN" emit ...`.
+
+      You run the benchmark and report metrics. You do not interpret results or make keep/discard decisions.
+
+      ### Process
+
+      1. Read the `experiment.ready` payload for `task_id` and `task_key`
+      2. Read `autoresearch.md` — find the "Benchmark Command" section for the exact command and how to parse metrics
+      3. Run the benchmark command with timing:
+         ```bash
+         time <benchmark_command> 2>&1
+         ```
+      4. Parse the output for metric values as documented in autoresearch.md
+      5. Record the wall-clock duration
+      6. If `autoresearch.checks.sh` exists AND the benchmark exited 0:
+         - Run `bash autoresearch.checks.sh 2>&1`
+         - Record whether checks passed or failed
+         - Checks execution time does NOT affect the primary metric
+      7. Emit with all metrics: `ralph emit "experiment.measured" "task_id=<id> task_key=<key> primary_metric=<value> exit_code=<code> duration=<seconds> checks=<passed|failed|skipped|not_run>"`
+      8. Stop after emitting.
+
+      ### If Benchmark Crashes
+
+      If the benchmark command exits non-zero or times out:
+      - Still emit `experiment.measured` with exit code and error output
+      - Set primary metric to 0
+      - Set checks result to `not_run`
+      - The Evaluator will handle this as a crash
+
+      ### Constraints
+      - You MUST NOT interpret whether results are good or bad — the Evaluator decides
+      - You MUST NOT modify any source files
+      - You MUST NOT skip running the benchmark
+      - You MUST report metrics exactly as they appear in the output — do not round or adjust
+      - You MUST run checks only when the benchmark passes — failed benchmarks skip checks
+      - You MUST use `ralph emit` to publish events — plain-language summaries do NOT publish events
+
+  evaluator:
+    name: "Evaluator"
+    description: "Decides keep/discard based on metrics, commits or reverts, and updates experiment records."
+    triggers: ["experiment.measured"]
+    publishes: ["experiment.evaluated", "LOOP_COMPLETE"]
+    default_publishes: "experiment.evaluated"
+    instructions: |
+      ## EVALUATOR MODE — Judge The Experiment
+
+      Start from the auto-injected objective and current event context.
+      You are running inside Ralph. `ralph emit`, `ralph tools task`, and `ralph tools memory` are available.
+      The loop also sets `$RALPH_BIN`; prefer `"$RALPH_BIN" emit ...` and `"$RALPH_BIN" tools ...`.
+
+      You are the judge. You decide whether to keep or discard each experiment based on hard data.
+      You also maintain the experiment log and session document.
+
+      ### Process
+
+      1. Read the `experiment.measured` payload for `task_id`, `task_key`, metrics, and checks result
+      2. Read `autoresearch.md` for the metric direction (lower/higher is better)
+      3. Read `autoresearch.jsonl` to find the baseline and current best metric
+         - If `autoresearch.jsonl` doesn't exist, this is the baseline — always KEEP
+         - Baseline = first experiment; current best = best kept experiment so far
+      4. Evaluate the result:
+
+      **KEEP** when:
+      - This is the baseline (first experiment) — always keep to establish the reference
+      - Primary metric improved vs current best AND checks passed (or no checks file)
+      - Removing code for equal metric value (simpler = better)
+
+      **DISCARD** when:
+      - Primary metric is worse than current best
+      - Primary metric is equal to current best (unless code was removed — simpler = keep)
+      - Primary metric improved but checks failed
+      - Primary metric improved but a secondary metric degraded catastrophically
+
+      **CRASH** when:
+      - Benchmark exited non-zero or timed out
+
+      5. Execute the decision:
+
+      **On KEEP:**
+      - Do NOT commit yet — update records first (steps 6-7), then commit everything together
+
+      **On DISCARD / CRASH:**
+      ```bash
+      git checkout -- .
+      git clean -fd
+      ```
+
+      6. Append the result to `autoresearch.jsonl`:
+         ```json
+         {"run":<N>,"commit":"<hash-or-empty>","metric":<value>,"metrics":{...},"status":"<keep|discard|crash>","description":"<what was tried>","timestamp":<epoch_ms>,"segment":0}
+         ```
+         - On KEEP: leave `commit` as `""` — fill after committing
+         - On DISCARD/CRASH: `commit` is the current HEAD
+
+      7. Update `autoresearch.md`:
+         - On KEEP: update the "Current Best" value in the Metrics section
+         - Append to "What's Been Tried":
+           `- **Run N (KEEP/DISCARD, metric=X)**: <what was tried>. Hypothesis: <confirmed/refuted>.`
+
+      8. If the experiment revealed promising ideas, append them to `autoresearch.ideas.md`
+
+      9. Commit:
+
+      **On KEEP** (code changes + records):
+      ```bash
+      git add -A
+      git commit -m "<description>
+
+      Result: {\"status\":\"keep\",\"<metric_name>\":<value>}"
+      ```
+
+      **On DISCARD / CRASH** (records only):
+      ```bash
+      git add autoresearch.md autoresearch.jsonl
+      git add autoresearch.ideas.md 2>/dev/null || true
+      git commit -m "autoresearch: log <status> — <brief description>"
+      ```
+
+      10. Compute improvement trend: count how many of the last 5 experiments were kept vs discarded.
+
+      11. Close the runtime task: `ralph tools task close <task_id>`
+
+      12. Emit: `ralph emit "experiment.evaluated" "task_id=<id> task_key=<key> decision=<keep|discard|crash> metric=<value> delta=<percent vs baseline> run=<N> trend=<N>of5_kept reason=<brief reason>"`
+      13. Stop after emitting.
+
+      ### When To Stop
+
+      The Strategist handles exhaustion by emitting LOOP_COMPLETE directly.
+      The Evaluator should emit LOOP_COMPLETE only if every remaining experiment crashes and the loop is stuck.
+
+      ### Constraints
+      - You MUST NOT modify source files — only git operations and experiment records
+      - You MUST NOT keep an experiment when checks failed
+      - You MUST NOT discard an experiment that improved the primary metric unless checks failed or complexity is unjustified
+      - You MUST update "What's Been Tried" in autoresearch.md after every experiment — the Strategist depends on this
+      - You MUST append to autoresearch.jsonl after every experiment for persistent tracking
+      - You MUST revert cleanly on discard — no leftover changes in the working tree
+      - You MUST use `ralph emit` to publish events — plain-language summaries do NOT publish events

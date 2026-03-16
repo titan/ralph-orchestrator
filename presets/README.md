@@ -8,6 +8,7 @@ Built-ins are embedded into the CLI from these files and exposed through `ralph 
 
 | Collection | Source | Best for |
 |---|---|---|
+| `autoresearch` | `presets/autoresearch.yml` | Autonomous experiment loop for any measurable improvement |
 | `code-assist` | `presets/code-assist.yml` | Default implementation workflow |
 | `debug` | `presets/debug.yml` | Investigation and fix verification |
 | `research` | `presets/research.yml` | Read-only exploration and synthesis |
@@ -33,6 +34,7 @@ These remain loadable for Ralph internals or testing, but are intentionally hidd
 ralph init --backend claude
 ralph init --list-presets
 
+ralph run -c ralph.yml -H builtin:autoresearch -p "Improve test coverage in src/core/"
 ralph run -c ralph.yml -H builtin:code-assist -p "Add OAuth login"
 ralph run -c ralph.yml -H builtin:debug -p "Investigate intermittent timeout"
 ralph run -c ralph.yml -H builtin:research -p "Map auth architecture"
